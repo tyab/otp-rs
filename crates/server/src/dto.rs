@@ -1,0 +1,220 @@
+//! `POST /plan` の JSON リクエスト/レスポンスの型。
+//!
+//! HTTP 層 (main.rs, tiny_http) から切り離してあるので、実サーバを起動せずに
+//! シリアライズ/デシリアライズと変換ロジックだけを単体テストできる。
+//!
+//! リクエスト例:
+//! ```json
+//! {"origin":{"lat":35.690,"lng":139.700},"destination":{"lat":35.707,"lng":139.759},
+//!  "departAt":"08:00","serviceDate":20260713,"mobility":"stroller"}
+//! ```
+//! `departAt` は `"HH:MM"` 文字列と 0時からの秒数(整数)のどちらも受け付ける
+//! (`otp_engine::RouteRequest::depart_at` が `SecondsSinceMidnight` = `i32` のため)。
+
+use serde::{Deserialize, Serialize};
+
+use otp_core::LatLng;
+use otp_engine::{Itinerary, Leg, Mobility, RouteRequest};
+
+#[derive(Debug, Deserialize)]
+pub struct LatLngDto {
+    pub lat: f64,
+    pub lng: f64,
+}
+
+/// `departAt`: `"HH:MM"` 文字列 か 0時からの秒数(整数)。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DepartAtDto {
+    Clock(String),
+    Seconds(i32),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlanRequestDto {
+    pub origin: LatLngDto,
+    pub destination: LatLngDto,
+    #[serde(rename = "departAt")]
+    pub depart_at: DepartAtDto,
+    #[serde(rename = "serviceDate")]
+    pub service_date: u32,
+    pub mobility: String,
+}
+
+impl PlanRequestDto {
+    /// `otp_engine::RouteRequest` へ変換する。`departAt` のパース失敗や未知の
+    /// `mobility` は `Err(理由)` にする (呼び出し側が 400 に変換する)。
+    pub fn into_route_request(self) -> Result<RouteRequest, String> {
+        let depart_at = match self.depart_at {
+            DepartAtDto::Seconds(s) => s,
+            DepartAtDto::Clock(s) => parse_hhmm(&s)?,
+        };
+        let mobility = match self.mobility.as_str() {
+            "solo" => Mobility::Solo,
+            "stroller" => Mobility::Stroller,
+            "wheelchair" => Mobility::Wheelchair,
+            other => return Err(format!("不明な mobility: {other} (solo|stroller|wheelchair のいずれか)")),
+        };
+        Ok(RouteRequest {
+            origin: LatLng::new(self.origin.lat, self.origin.lng),
+            destination: LatLng::new(self.destination.lat, self.destination.lng),
+            depart_at,
+            service_date: self.service_date,
+            mobility,
+        })
+    }
+}
+
+fn parse_hhmm(s: &str) -> Result<i32, String> {
+    let (h, m) = s.split_once(':').ok_or_else(|| format!("departAt は \"HH:MM\" か秒数で指定してください: {s:?}"))?;
+    let h: i32 = h.parse().map_err(|_| format!("departAt の時が不正です: {s:?}"))?;
+    let m: i32 = m.parse().map_err(|_| format!("departAt の分が不正です: {s:?}"))?;
+    Ok(h * 3600 + m * 60)
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanResponseDto {
+    pub itineraries: Vec<ItineraryDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ItineraryDto {
+    #[serde(rename = "totalDurationS")]
+    pub total_duration_s: u32,
+    pub transfers: u8,
+    #[serde(rename = "fareYen")]
+    pub fare_yen: Option<f64>,
+    pub legs: Vec<LegDto>,
+}
+
+/// `mode` タグで WALK/TRANSIT を判別する (フロント側が `switch(leg.mode)` できる形)。
+#[derive(Debug, Serialize)]
+#[serde(tag = "mode")]
+pub enum LegDto {
+    #[serde(rename = "WALK")]
+    Walk {
+        #[serde(rename = "distanceM")]
+        distance_m: f32,
+        #[serde(rename = "durationS")]
+        duration_s: u32,
+        #[serde(rename = "hasStairs")]
+        has_stairs: bool,
+    },
+    #[serde(rename = "TRANSIT")]
+    Transit {
+        #[serde(rename = "routeName")]
+        route_name: String,
+        #[serde(rename = "fromStop")]
+        from_stop: String,
+        #[serde(rename = "toStop")]
+        to_stop: String,
+        #[serde(rename = "durationS")]
+        duration_s: u32,
+    },
+}
+
+impl PlanResponseDto {
+    pub fn from_itineraries(itineraries: &[Itinerary]) -> Self {
+        Self { itineraries: itineraries.iter().map(ItineraryDto::from_itinerary).collect() }
+    }
+}
+
+impl ItineraryDto {
+    fn from_itinerary(it: &Itinerary) -> Self {
+        Self {
+            total_duration_s: it.total_duration_s,
+            transfers: it.transfers,
+            fare_yen: it.fare_yen,
+            legs: it.legs.iter().map(LegDto::from_leg).collect(),
+        }
+    }
+}
+
+impl LegDto {
+    fn from_leg(leg: &Leg) -> Self {
+        match leg {
+            Leg::Walk { distance_m, duration_s, has_stairs } => {
+                LegDto::Walk { distance_m: *distance_m, duration_s: *duration_s, has_stairs: *has_stairs }
+            }
+            Leg::Transit { route_name, from_stop, to_stop, duration_s } => {
+                LegDto::Transit { route_name: route_name.clone(), from_stop: from_stop.clone(), to_stop: to_stop.clone(), duration_s: *duration_s }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorDto {
+    pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_request_deserializes_with_clock_string_depart_at() {
+        let body = r#"{"origin":{"lat":35.69,"lng":139.70},"destination":{"lat":35.707,"lng":139.759},
+                        "departAt":"08:15","serviceDate":20260713,"mobility":"stroller"}"#;
+        let dto: PlanRequestDto = serde_json::from_str(body).expect("should deserialize");
+        let req = dto.into_route_request().expect("should convert");
+        assert_eq!(req.depart_at, 8 * 3600 + 15 * 60);
+        assert_eq!(req.service_date, 20260713);
+        assert_eq!(req.mobility, Mobility::Stroller);
+        assert!((req.origin.lat - 35.69).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plan_request_deserializes_with_numeric_seconds_depart_at() {
+        let body = r#"{"origin":{"lat":35.69,"lng":139.70},"destination":{"lat":35.707,"lng":139.759},
+                        "departAt":29700,"serviceDate":20260713,"mobility":"solo"}"#;
+        let dto: PlanRequestDto = serde_json::from_str(body).expect("should deserialize");
+        let req = dto.into_route_request().expect("should convert");
+        assert_eq!(req.depart_at, 29700);
+        assert_eq!(req.mobility, Mobility::Solo);
+    }
+
+    #[test]
+    fn unknown_mobility_is_rejected() {
+        let body = r#"{"origin":{"lat":35.69,"lng":139.70},"destination":{"lat":35.707,"lng":139.759},
+                        "departAt":"08:00","serviceDate":20260713,"mobility":"bicycle"}"#;
+        let dto: PlanRequestDto = serde_json::from_str(body).expect("should deserialize");
+        let err = dto.into_route_request().expect_err("should reject unknown mobility");
+        assert!(err.contains("bicycle"), "err was: {err}");
+    }
+
+    #[test]
+    fn malformed_clock_depart_at_is_rejected() {
+        let body = r#"{"origin":{"lat":35.69,"lng":139.70},"destination":{"lat":35.707,"lng":139.759},
+                        "departAt":"not-a-time","serviceDate":20260713,"mobility":"solo"}"#;
+        let dto: PlanRequestDto = serde_json::from_str(body).expect("should deserialize");
+        assert!(dto.into_route_request().is_err());
+    }
+
+    #[test]
+    fn itinerary_serializes_with_tagged_leg_modes() {
+        let itineraries = vec![Itinerary {
+            legs: vec![
+                Leg::Walk { distance_m: 120.5, duration_s: 90, has_stairs: false },
+                Leg::Transit { route_name: "都営新宿線".to_string(), from_stop: "新宿".to_string(), to_stop: "本郷三丁目".to_string(), duration_s: 1200 },
+            ],
+            total_duration_s: 1400,
+            transfers: 0,
+            fare_yen: Some(220.0),
+        }];
+        let dto = PlanResponseDto::from_itineraries(&itineraries);
+        let json = serde_json::to_string(&dto).expect("should serialize");
+        assert!(json.contains("\"mode\":\"WALK\""), "json was: {json}");
+        assert!(json.contains("\"mode\":\"TRANSIT\""), "json was: {json}");
+        assert!(json.contains("\"totalDurationS\":1400"));
+        assert!(json.contains("\"fareYen\":220.0"));
+        assert!(json.contains("\"routeName\":\"都営新宿線\""));
+    }
+
+    #[test]
+    fn error_dto_serializes_as_error_field() {
+        let dto = ErrorDto { error: "bad request".to_string() };
+        let json = serde_json::to_string(&dto).unwrap();
+        assert_eq!(json, r#"{"error":"bad request"}"#);
+    }
+}
