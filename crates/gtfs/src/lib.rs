@@ -36,6 +36,12 @@ pub struct Stop {
     pub wheelchair_boarding: WheelchairBoarding,
     /// 親駅 (`parent_station`)。ホーム→駅の集約に使う。
     pub parent_station: Option<StopId>,
+    /// 運賃ゾーン (`zone_id`)。`fare_rules.txt` の `origin_id`/`destination_id` が参照する。
+    /// 実測 (都営/メトロ/りんかい/京王/東武の GTFS): 全フィードが `stops.txt` に
+    /// `zone_id` 列を持ち、駅1つにつき固有のゾーンID (実質 stop_id と同値) を割り当てる
+    /// 「距離制運賃を駅対ゾーンペアで表現する」方式。自前頻度 GTFS (JR) は
+    /// `stops.txt` 自体に `zone_id` 列が無く常に `None` (運賃データなし、otp-fares 参照)。
+    pub zone_id: Option<String>,
 }
 
 /// 路線種別 (GTFS `route_type` の必要分)。
@@ -183,7 +189,15 @@ impl Feed {
     /// 複数フィード統合用: `feed_prefix` を `"<feed_prefix>:<id>"` の形で
     /// stop_id/route_id/trip_id/service_id (および相互参照列: `parent_station`,
     /// `trips.route_id`/`trips.service_id`, `stop_times` の trip_id/stop_id,
-    /// `fare_rules.route_id`) に前置して読み込む。
+    /// `fare_rules.route_id`, `stops.zone_id`, `fare_rules.origin_id`/
+    /// `destination_id`/`contains_id`) に前置して読み込む。
+    ///
+    /// `zone_id` 系も他の ID と同様に前置するのは、`zone_id` が実質 stop_id と同じ小さい
+    /// 整数を事業者間で使い回している (実測: 都営/メトロ/りんかい/京王/東武いずれも
+    /// 駅ごとに固有だが桁数の小さい ID) ため、素朴にマージすると別事業者の運賃ゾーンが
+    /// 衝突しうるからである (route_id/service_id と同じ理由、上のコメント参照)。
+    /// これにより `otp-fares::FareModel` はフィードごとに前置済みの `zone_id` /
+    /// `fare_rules.origin_id`/`destination_id` を突き合わせるだけでよくなる。
     ///
     /// 実測 (babymobi infra/otp/data): 都営・メトロ・京王・東武・りんかいの GTFS は
     /// いずれも `route_id`/`service_id` が事業者間で "0"〜"4" 等の小さい整数を再利用
@@ -205,6 +219,7 @@ impl Feed {
         for s in &mut self.stops {
             s.id = StopId::new(ns(s.id.as_str()));
             s.parent_station = s.parent_station.take().map(|p| StopId::new(ns(p.as_str())));
+            s.zone_id = s.zone_id.take().map(|z| ns(&z));
         }
         for r in &mut self.routes {
             r.id = RouteId::new(ns(r.id.as_str()));
@@ -226,6 +241,9 @@ impl Feed {
         }
         for fr in &mut self.fare_rules {
             fr.route_id = fr.route_id.take().map(|r| RouteId::new(ns(r.as_str())));
+            fr.origin_id = fr.origin_id.take().map(|z| ns(&z));
+            fr.destination_id = fr.destination_id.take().map(|z| ns(&z));
+            fr.contains_id = fr.contains_id.take().map(|z| ns(&z));
         }
     }
 }
@@ -293,6 +311,7 @@ fn parse_stops(t: &Table) -> Result<Vec<Stop>> {
                 lng,
                 wheelchair_boarding: parse_wheelchair(row.get("wheelchair_boarding")),
                 parent_station: row.get("parent_station").map(StopId::new),
+                zone_id: row.get("zone_id").map(str::to_string),
             })
         })
         .collect()
@@ -560,6 +579,36 @@ mod tests {
         // calendar / calendar_dates の service_id も前置される。
         assert!(feed.calendars.iter().any(|c| c.service_id.as_str() == "toei:WD"));
         assert!(feed.calendar_dates.iter().any(|cd| cd.service_id.as_str() == "toei:WD"));
+    }
+
+    #[test]
+    fn zone_id_is_parsed_with_gtfs_optional_empty_is_none_convention() {
+        let t = Table::parse("stop_id,stop_name,stop_lat,stop_lon,zone_id\nX,X駅,35.0,139.0,900\nY,Y駅,35.1,139.1,\n");
+        let stops = parse_stops(&t).expect("should parse");
+        assert_eq!(stops[0].zone_id.as_deref(), Some("900"));
+        assert_eq!(stops[1].zone_id, None, "zone_id列が空文字ならNone (他のoptional列と同じ慣習)");
+    }
+
+    #[test]
+    fn namespace_prefixes_zone_id_and_fare_rule_zone_columns() {
+        // 実測: 都営/メトロ/りんかい/京王/東武の GTFS はいずれも zone_id が駅ごとに固有の
+        // 小さい整数 (実質 stop_id と同値) で、事業者間では衝突しうる。route_id/service_id
+        // と同じ理由で名前空間化が必要 (Feed::namespace のモジュールdoc参照)。
+        let stops_t = Table::parse("stop_id,stop_name,stop_lat,stop_lon,zone_id\nX,X駅,35.0,139.0,900\n");
+        let fare_rules_t = Table::parse("fare_id,route_id,origin_id,destination_id,contains_id\nF1,,900,901,902\n");
+
+        let mut feed = Feed {
+            stops: parse_stops(&stops_t).expect("stops should parse"),
+            fare_rules: parse_fare_rules(&fare_rules_t).expect("fare_rules should parse"),
+            ..Feed::default()
+        };
+        feed.namespace("toei");
+
+        assert_eq!(feed.stops[0].zone_id.as_deref(), Some("toei:900"));
+        let rule = &feed.fare_rules[0];
+        assert_eq!(rule.origin_id.as_deref(), Some("toei:900"));
+        assert_eq!(rule.destination_id.as_deref(), Some("toei:901"));
+        assert_eq!(rule.contains_id.as_deref(), Some("toei:902"));
     }
 
     #[test]

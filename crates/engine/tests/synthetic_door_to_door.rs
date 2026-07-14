@@ -7,11 +7,11 @@
 //! 実データでの突き合わせ (新宿⇄本郷三丁目、本家OTPとの数値比較) は
 //! `tests/door_to_door.rs` の役目。こちらは「配線が正しいか」の高速な回帰テスト。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use otp_core::LatLng;
 use otp_engine::{Engine, Leg, Mobility, RouteRequest};
-use otp_fares::FareModel;
 use otp_gtfs::Feed;
 use otp_raptor::Timetable;
 use otp_street::StreetGraph;
@@ -40,7 +40,13 @@ fn build_engine() -> Engine {
     let feed = Feed::load_from_dir(&fixture_dir()).expect("mini fixture should load");
     let timetable = Timetable::build(&[feed]).expect("timetable should build");
     let street = StreetGraph::build_from_osm_xml_str(WALK_FIXTURE_OSM);
-    Engine::new(street, timetable, FareModel::default())
+    // mini fixture は Feed::load_from_dir_namespaced を通さない単一フィード構成で、
+    // stops.txt に zone_id も無い (運賃ゾーン無し)。運賃配線そのもの (フィード名前空間
+    // 単位での FareModel 選択・ゾーン一致) の実データ検証は `tests/door_to_door.rs`
+    // (都営/メトロ等6フィード、本家OTPとの数値突き合わせ) の役目なので、ここでは
+    // FareModel を登録しない (`fare_yen` は otp_fares::FareModel が無いフィードとして
+    // 常に None になる。`otp_engine::Engine::compute_fare` 参照)。
+    Engine::new(street, timetable, HashMap::new())
 }
 
 fn base_request(mobility: Mobility) -> RouteRequest {
@@ -103,7 +109,8 @@ fn plan_wires_access_walk_raptor_and_egress_walk_into_one_itinerary() {
     }
 
     assert_eq!(best.transfers, 1, "都庁前相当 (C駅) で1回乗換のはず");
-    assert!(best.fare_yen.is_none(), "運賃は今スライスでは常に None");
+    // mini fixture には FareModel を登録していない (build_engine 参照) ので None。
+    assert!(best.fare_yen.is_none(), "FareModelを登録していないフィードの運賃はNoneのはず");
     // RAPTOR の到着 (08:30 出発+乗換込み) に access/egress 徒歩が乗るので、
     // 少なくとも鉄道所要 (30分) より長くなるはず。
     assert!(best.total_duration_s > 30 * 60, "total_duration_s={}", best.total_duration_s);
@@ -130,7 +137,7 @@ fn wheelchair_walks_slower_than_solo_so_total_duration_is_not_shorter() {
 fn plan_returns_empty_when_street_graph_is_unbuilt() {
     let feed = Feed::load_from_dir(&fixture_dir()).expect("mini fixture should load");
     let timetable = Timetable::build(&[feed]).expect("timetable should build");
-    let engine = Engine::new(StreetGraph::default(), timetable, FareModel::default());
+    let engine = Engine::new(StreetGraph::default(), timetable, HashMap::new());
 
     let itineraries = engine.plan(&base_request(Mobility::Solo)).expect("should not error, just empty");
     assert!(itineraries.is_empty(), "未構築の street グラフでは空を返すはず");

@@ -82,17 +82,24 @@ const MAX_RAPTOR_ROUNDS: u8 = 4;
 /// エンジン本体。構築済みグラフ/時刻表/運賃モデルを保持し、リクエストに応答する。
 ///
 /// これがネイティブサーバ (otp-server) の中身であり、将来 wasm32 で Worker に載せる対象。
+///
+/// `fares` はフィード (事業者) 単位で保持する: `otp_gtfs::Feed::load_from_dir_namespaced`
+/// が付ける名前空間 prefix (例: 都営なら `"6"`, `crates/raptor/examples/plan.rs` の
+/// モジュールdoc参照) をキーにした `HashMap`。運賃計算は「乗車 Leg が属すフィードの
+/// `FareModel` を引いて計算する」設計 (`compute_fare` 参照) なので、呼び出し側は
+/// `Timetable::build` に渡したのと同じフィード群から、同じ prefix で
+/// `HashMap::from([(prefix, otp_fares::FareModel::from_gtfs(&feed)), ...])` を組んで渡す。
 pub struct Engine {
     pub street: otp_street::StreetGraph,
     pub timetable: otp_raptor::Timetable,
-    pub fares: otp_fares::FareModel,
+    pub fares: HashMap<String, otp_fares::FareModel>,
 }
 
 impl Engine {
     pub fn new(
         street: otp_street::StreetGraph,
         timetable: otp_raptor::Timetable,
-        fares: otp_fares::FareModel,
+        fares: HashMap<String, otp_fares::FareModel>,
     ) -> Self {
         Self {
             street,
@@ -119,7 +126,8 @@ impl Engine {
     ///      モジュール doc 参照)。
     ///   4. 到着が早い順 (`total_duration_s` 昇順) にソートして返す。
     ///
-    /// 運賃 (`fare_yen`) は今回のスライスでは常に `None` (次スライスで実装)。
+    /// 運賃 (`fare_yen`) は各 `Journey` から [`Engine::compute_fare`] で計算する
+    /// (フィードごとの `FareModel` を突き合わせる。詳細は `compute_fare` のdoc参照)。
     ///
     /// street グラフが未構築 (`self.street.nodes` が空) の場合や、半径内に
     /// access/egress どちらかの候補駅が1つも無い/実際に歩行経路が引けない場合は
@@ -224,9 +232,68 @@ impl Engine {
             legs,
             total_duration_s: (journey.arrival_s - req.depart_at).max(0) as u32,
             transfers: journey.transfers,
-            fare_yen: None,
+            fare_yen: self.compute_fare(journey),
         }
     }
+
+    /// 経路全体の運賃 (円) を計算する。
+    ///
+    /// `journey.legs` を先頭から走査し、連続する `JourneyLeg::Transit` を「フィード
+    /// (route_id の名前空間 prefix, [`feed_prefix`]) が同じ」限り1グループにまとめる
+    /// (`Leg::Walk` を挟むか、フィードが変わったところでグループを区切る)。これは
+    /// 本家 OTP の実測 (`otp_fares` モジュールdoc「都営単一事業者・乗換1回」) で、
+    /// 同一事業者内の乗換を挟む2 leg に同一の1個の運賃product が紐付くことに対応する
+    /// (同一駅乗換は `otp_raptor::Timetable::search` が明示的な `Walk` leg を挟まずに
+    /// 連続する `Transit` leg として返すため、この単純な「Walk無しなら同一グループ」
+    /// 判定で実データの事例をカバーできる。近接駅を歩いて跨ぐ同一事業者内乗換は
+    /// 別グループ扱いになり別途課金される近似だが、実データではこのケースは
+    /// 都営↔メトロ等の事業者跨ぎでしか観測していない)。
+    ///
+    /// 各グループを、そのフィードの `FareModel::total_fare` に渡して運賃を求め、
+    /// グループ間 (=事業者間) は単純合算する (本家 OTP 実測「事業者跨ぎ」参照)。
+    ///
+    /// いずれかのグループで運賃が求まらない場合 (対応する `FareModel` が `self.fares` に
+    /// 無い = zone_id を持たないフィード、例: 自前頻度 GTFS の JR。または zone_id は
+    /// あるが該当する `fare_rules` が無い) は、判明分だけの部分合計を返さず全体を
+    /// `None` にする (実際より安い金額を誤って提示しないため)。
+    fn compute_fare(&self, journey: &otp_raptor::Journey) -> Option<f64> {
+        let legs = &journey.legs;
+        let mut total = 0.0;
+        let mut i = 0;
+        while i < legs.len() {
+            let otp_raptor::JourneyLeg::Transit { route_id, .. } = &legs[i] else {
+                i += 1;
+                continue;
+            };
+            let prefix = feed_prefix(route_id.as_str()).to_string();
+
+            let mut group: Vec<otp_fares::FareLeg> = Vec::new();
+            while let Some(otp_raptor::JourneyLeg::Transit { route_id: rid, from, to, .. }) = legs.get(i) {
+                if feed_prefix(rid.as_str()) != prefix {
+                    break;
+                }
+                group.push(otp_fares::FareLeg {
+                    route_id: Some(rid.clone()),
+                    origin_zone: self.timetable.stop_zone(*from).map(str::to_string),
+                    destination_zone: self.timetable.stop_zone(*to).map(str::to_string),
+                    contains_zones: Vec::new(),
+                });
+                i += 1;
+            }
+
+            let model = self.fares.get(&prefix)?;
+            let fare = model.total_fare(&group).ok()?;
+            total += fare.amount;
+        }
+        Some(total)
+    }
+}
+
+/// 名前空間化済み ID (`"<feed_prefix>:<raw_id>"`, `otp_gtfs::Feed::namespace` 参照) から
+/// フィード prefix を取り出す。namespace 化されていない ID (`:` を含まない。単一フィード
+/// 構成のテスト等) は ID 全体をそのまま prefix として扱う (フォールバック)。
+fn feed_prefix(id: &str) -> &str {
+    id.split_once(':').map(|(prefix, _)| prefix).unwrap_or(id)
 }
 
 /// [`Engine::walk_links`] の戻り値: RAPTOR に渡す `StreetLink` 一覧と、

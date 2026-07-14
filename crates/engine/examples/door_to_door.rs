@@ -14,6 +14,7 @@
 //! GTFS の在り処は `crates/raptor/examples/plan.rs` と同じ規約 (既定は
 //! `../../../infra/otp/data/<feed>.zip`。`OTP_RS_GTFS_DATA_DIR` で差し替え可能)。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -109,7 +110,12 @@ fn main() {
     let street = StreetGraph::build_from_osm_xml(&osm_path).expect("street graph build failed");
     eprintln!("street graph built: {} nodes, {} edges ({:?})", street.nodes.len(), street.edges.len(), t1.elapsed());
 
-    let engine = Engine::new(street, timetable, FareModel::default());
+    // フィードごとに FareModel を組み、Engine に登録する (`otp_engine::Engine` の
+    // モジュールdoc参照: `Feed::load_from_dir_namespaced` が付けた prefix がキー)。
+    let fares: HashMap<String, FareModel> =
+        FEEDS.iter().zip(feeds.iter()).map(|((prefix, _), feed)| (prefix.to_string(), FareModel::from_gtfs(feed))).collect();
+
+    let engine = Engine::new(street, timetable, fares);
     let req = RouteRequest { origin, destination, depart_at, service_date, mobility };
 
     let t2 = std::time::Instant::now();

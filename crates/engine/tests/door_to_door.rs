@@ -17,6 +17,7 @@
 //! otp-rs 側は鉄道のみ (バス非対応, RAPTOR側スコープ) かつ近接駅乗換が直線距離近似
 //! (`otp_raptor` モジュールdoc参照) なので厳密一致はしない。「桁が合う」ことを見る。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -127,7 +128,14 @@ fn build_engine_or_skip() -> Option<Engine> {
     let timetable = Timetable::build(&feeds).expect("timetable should build from real feeds");
     let osm_xml = prepare_osm_xml()?;
     let street = StreetGraph::build_from_osm_xml(&osm_xml).expect("street graph should build from real OSM XML");
-    Some(Engine::new(street, timetable, FareModel::default()))
+    // フィードごとに FareModel を組む (`otp_engine::Engine` のモジュールdoc参照)。
+    // `load_all_feeds_or_skip` が `Feed::load_from_dir_namespaced(_, prefix)` で
+    // 読み込んでいるので、`feed.fare_attributes`/`fare_rules` の zone_id 系は
+    // 既にこの prefix で名前空間化済み (自前頻度JR=feed "1" は fare データ自体を持たず、
+    // 実質空の FareModel になる → JR区間を含む経路の運賃は None になる)。
+    let fares: HashMap<String, FareModel> =
+        FEEDS.iter().zip(feeds.iter()).map(|((prefix, _), feed)| (prefix.to_string(), FareModel::from_gtfs(feed))).collect();
+    Some(Engine::new(street, timetable, fares))
 }
 
 const SHINJUKU: LatLng = LatLng::new(35.690, 139.700);
@@ -154,7 +162,13 @@ fn shinjuku_to_hongo_sanchome_door_to_door_is_sane_for_solo_and_stroller() {
         assert!(!itineraries.is_empty(), "{mobility:?}: 経路が1つも見つからなかった");
 
         let best = &itineraries[0];
-        eprintln!("=== {mobility:?}: total_duration_s={} ({:.1}分) transfers={} ===", best.total_duration_s, best.total_duration_s as f64 / 60.0, best.transfers);
+        eprintln!(
+            "=== {mobility:?}: total_duration_s={} ({:.1}分) transfers={} fare_yen={:?} ===",
+            best.total_duration_s,
+            best.total_duration_s as f64 / 60.0,
+            best.transfers,
+            best.fare_yen
+        );
         for leg in &best.legs {
             eprintln!("  {leg:?}");
         }
@@ -173,7 +187,15 @@ fn shinjuku_to_hongo_sanchome_door_to_door_is_sane_for_solo_and_stroller() {
             best.total_duration_s
         );
         assert!(best.transfers <= 3, "{mobility:?}: transfers={} が多すぎる", best.transfers);
-        assert!(best.fare_yen.is_none(), "運賃は今スライスでは常に None のはず");
+        // 新宿⇄本郷三丁目は都営/メトロいずれも運賃データ (fare_attributes/fare_rules) を
+        // 持つフィードのみで到達できる (自前頻度JRを経由しない) ため、fare_yen は必ず
+        // 判明する。金額は経路選定 (どの駅で乗換えるか) に依存し得るため厳密な1点では
+        // 検証せず、実測レンジ (都営/メトロの初乗り〜複数区間分, 100円台〜1000円台) で見る
+        // (本家OTPとの数値突き合わせは `scripts/compare_otp.sh` の固定OD、および
+        // otp-fares クレートのユニットテストの役目)。
+        assert!(best.fare_yen.is_some(), "{mobility:?}: 都営/メトロのみで到達可能なはずなのに fare_yen が None だった: {best:?}");
+        let fare = best.fare_yen.unwrap();
+        assert!((100.0..2000.0).contains(&fare), "{mobility:?}: fare_yen={fare} は想定レンジ外");
     }
 }
 

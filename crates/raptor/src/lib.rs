@@ -102,6 +102,13 @@ pub struct Timetable {
     /// StopIdx → 正規化停留所の座標 (同一正規化停留所に属す生 stop の平均)。
     /// otp-engine が「座標 → 近傍駅」を引く (`nearby_stops`) ためにここで保持する。
     stop_coords: Vec<LatLng>,
+    /// StopIdx → 運賃ゾーン (`Stop::zone_id`, 既に名前空間化済み)。otp-engine が
+    /// `JourneyLeg::Transit` の from/to から `otp_fares::FareLeg` を組むために使う
+    /// (`Timetable::stop_zone`)。同一正規化停留所 (`parent_station` 集約後) に複数の
+    /// 生 stop が属す場合は、最初に見つかった非空の zone_id を採用する (実データは
+    /// どのフィードも parent_station が空でこのケースはほぼ発生しない。座標平均と違い
+    /// 「複数ゾーンの平均」は意味を持たないため単純な early-win にした)。
+    stop_zones: Vec<Option<String>>,
 }
 
 impl Timetable {
@@ -121,6 +128,7 @@ impl Timetable {
         let mut stop_lookup: HashMap<StopId, StopIdx> = HashMap::new();
         let mut canonical_of: HashMap<StopId, StopId> = HashMap::new();
         let mut coord_acc: HashMap<StopId, (f64, f64, u32)> = HashMap::new();
+        let mut zone_of: HashMap<StopId, String> = HashMap::new();
 
         for feed in feeds {
             for stop in &feed.stops {
@@ -134,10 +142,15 @@ impl Timetable {
                 let idx = stop_lookup[&canonical];
                 stop_lookup.entry(stop.id.clone()).or_insert(idx);
 
-                let acc = coord_acc.entry(canonical).or_insert((0.0, 0.0, 0));
+                let acc = coord_acc.entry(canonical.clone()).or_insert((0.0, 0.0, 0));
                 acc.0 += stop.lat;
                 acc.1 += stop.lng;
                 acc.2 += 1;
+
+                // 最初に見つかった非空の zone_id を採用 (struct doc 参照)。
+                if let Some(z) = &stop.zone_id {
+                    zone_of.entry(canonical).or_insert_with(|| z.clone());
+                }
             }
         }
 
@@ -277,7 +290,9 @@ impl Timetable {
             }
         }
 
-        Ok(Timetable { stop_ids, stop_lookup, patterns, stop_patterns, transfers, calendars, stop_coords })
+        let stop_zones: Vec<Option<String>> = stop_ids.iter().map(|id| zone_of.get(id).cloned()).collect();
+
+        Ok(Timetable { stop_ids, stop_lookup, patterns, stop_patterns, transfers, calendars, stop_coords, stop_zones })
     }
 
     /// GTFS 生 stop_id (プラットフォーム含む) または正規化済み StopId から StopIdx を引く。
@@ -288,6 +303,13 @@ impl Timetable {
     /// StopIdx → 座標。
     pub fn stop_coord(&self, stop: StopIdx) -> LatLng {
         self.stop_coords[stop as usize]
+    }
+
+    /// StopIdx → 運賃ゾーン (`zone_id`, 名前空間化済み)。無ければ `None`
+    /// (`zone_id` 列を持たないフィード、例: 自前頻度 GTFS の JR)。otp-engine が
+    /// `otp_fares::FareLeg` を組むために使う。
+    pub fn stop_zone(&self, stop: StopIdx) -> Option<&str> {
+        self.stop_zones[stop as usize].as_deref()
     }
 
     /// `coord` から直線距離 `radius_m` 以内の停留所を、近い順に返す。
@@ -651,6 +673,30 @@ mod tests {
     fn load() -> Timetable {
         let feed = Feed::load_from_dir(&fixture_dir()).expect("mini fixture should load");
         Timetable::build(&[feed]).expect("timetable should build")
+    }
+
+    #[test]
+    fn stop_zone_resolves_namespaced_zone_and_collapses_platforms_to_first_seen() {
+        use otp_gtfs::{Stop, WheelchairBoarding};
+        // 手組みの Feed: A駅 (zone無し) と、C駅 (parent_station=C, プラットフォーム
+        // C1(zone=900)/C2(zone=901) を持つ) の2駅。実データはこのプラットフォーム分岐が
+        // ほぼ発生しないため、Timetable::build の「最初に見つかった非空 zone_id を採用」
+        // という単純化 (struct doc 参照) を明示的に検証する。
+        let feed = Feed {
+            stops: vec![
+                Stop { id: StopId::new("A"), name: "A".into(), lat: 35.0, lng: 139.0, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+                Stop { id: StopId::new("C1"), name: "C1".into(), lat: 35.1, lng: 139.1, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: Some(StopId::new("C")), zone_id: Some("900".into()) },
+                Stop { id: StopId::new("C2"), name: "C2".into(), lat: 35.1, lng: 139.1, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: Some(StopId::new("C")), zone_id: Some("901".into()) },
+            ],
+            ..Feed::default()
+        };
+        let tt = Timetable::build(&[feed]).expect("timetable should build");
+
+        let a = tt.stop_idx(&StopId::new("A")).expect("A should be registered");
+        assert_eq!(tt.stop_zone(a), None, "zone_idが無い駅はNone");
+
+        let c = tt.stop_idx(&StopId::new("C")).expect("C (canonical) should be registered");
+        assert_eq!(tt.stop_zone(c), Some("900"), "C1(900)が先に見つかるのでC1のzoneを採用");
     }
 
     #[test]
