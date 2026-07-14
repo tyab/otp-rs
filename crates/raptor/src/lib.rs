@@ -5,16 +5,42 @@
 //!
 //! ## このスライスのスコープ
 //! - **鉄道のみ** (`RouteType::is_rail()` = Tram/Subway/Rail)。バスは除外し時刻表を小さく保つ。
-//! - 乗換は「同一 `parent_station` または同一 `stop_id`」の0分乗換のみ。近接駅の徒歩乗換
-//!   (別駅間) は otp-street 実装後の次スライスで対応する。
+//! - **複数フィード対応**: `Timetable::build` は複数 `Feed` をマージするが、ID の
+//!   一意性は呼び出し側の責任 (`otp_gtfs::Feed::load_from_dir_namespaced` で
+//!   事前に名前空間化しておくこと)。実測: 都営/メトロ/京王/東武/りんかい GTFS は
+//!   いずれも route_id/service_id に "0"〜"4" 等の小さい整数を事業者間で使い回して
+//!   おり、素朴なマージは別事業者のカレンダー/路線を上書きして壊れる。
+//! - **乗換モデル**: transfers.txt はどのフィードにも存在しない (実測)。代わりに
+//!   (a) 同一正規化停留所内 (`parent_station` 集約後の同一 StopIdx) の乗換には
+//!   既定バッファ `DEFAULT_TRANSFER_BUFFER_S` を課す、(b) 異なる停留所間で直線距離が
+//!   `MAX_WALK_TRANSFER_M` 以内なら徒歩時間 (`WALK_SPEED_MPS` 基準) + バッファの
+//!   乗換エッジを張る (事業者をまたいでも可、例: メトロ↔都営 白金高輪)。
+//!   直線距離ベースの近似のため、地下通路のように迂回が大きい実際の徒歩経路とは
+//!   厳密には一致しない (`scripts/compare_otp.sh` の実測差分を参照)。
 //! - access/egress は駅指定 (`StreetLink`) で与える。徒歩ルーティングは otp-street 側の役割。
-//! - 複数フィードをまたぐ ID 衝突 (例: 事業者ごとに `service_id="0"` が別サービスを指す) は
-//!   未対応。今スライスの実データ検証は単一フィード (都営地下鉄) のみで行う。
 
 use std::collections::HashMap;
 
-use otp_core::{Result, RouteId, SecondsSinceMidnight, StopId, TripId};
+use otp_core::{LatLng, Result, RouteId, SecondsSinceMidnight, StopId, TripId};
 use otp_gtfs::Feed;
+
+/// 乗換に要する既定バッファ (秒)。transfers.txt が無いフィード (実測: 都営/メトロ/
+/// りんかい/京王/東武いずれも `transfers.txt` を含まない) で、同一駅内乗換・近接駅
+/// 徒歩乗換の両方に加える固定の乗換所要時間。OTP は実際の駅構内/街路ネットワークの
+/// 徒歩時間を使うため厳密には一致しないが、「0分乗換」よりは実態に近い下限値として使う。
+const DEFAULT_TRANSFER_BUFFER_S: u32 = 120;
+
+/// 近接駅の徒歩乗換を許容する最大直線距離 (メートル)。これを超える駅間は接続しない
+/// (地下鉄駅間の徒歩乗換は概ねこの範囲に収まる想定。実測との突き合わせは
+/// `scripts/compare_otp.sh` を参照)。
+const MAX_WALK_TRANSFER_M: f64 = 150.0;
+
+/// 徒歩速度 (m/s)。実測 (OTP2 公式ドキュメント, 2026-07-15 確認):
+/// `RouteRequest` の `walkSpeed` 既定値は 1.35 m/s、`RouterConfiguration` の
+/// `routingDefaults` サンプルでは 1.3 m/s。ここでは直線距離しか使えないこのスライスの
+/// 近似 (実際の徒歩経路は地下通路・街路網の迂回でより長くなりがち) を織り込み、
+/// やや保守的な 1.3 m/s を採用する。
+const WALK_SPEED_MPS: f64 = 1.3;
 
 /// 停留所のコンパクト添字。
 pub type StopIdx = u32;
@@ -52,6 +78,14 @@ struct ServiceCalendar {
     removed_dates: Vec<u32>,
 }
 
+/// 乗換エッジ1本 (RAPTOR のラウンド間で使う「footpath」)。同一駅内の乗換バッファ
+/// (自己ループ, `to_stop == 自身`) と、近接駅への徒歩乗換の両方をこの型で表す。
+#[derive(Debug, Clone, Copy)]
+struct Transfer {
+    to_stop: StopIdx,
+    duration_s: u32,
+}
+
 /// RAPTOR 用に詰めた時刻表。
 #[derive(Debug, Default)]
 pub struct Timetable {
@@ -62,16 +96,28 @@ pub struct Timetable {
     pub patterns: Vec<Pattern>,
     /// StopIdx → そのパターン内での出現位置一覧。
     stop_patterns: Vec<Vec<(PatternIdx, u32)>>,
+    /// StopIdx → 乗換エッジ一覧 (自己バッファ + 近接駅徒歩乗換)。
+    transfers: Vec<Vec<Transfer>>,
     calendars: HashMap<otp_core::ServiceId, ServiceCalendar>,
 }
 
 impl Timetable {
     /// `otp-gtfs::Feed` 群から鉄道のみの時刻表を構築する。
+    ///
+    /// 複数フィードをまたぐ場合は、呼び出し側が事前に
+    /// `Feed::load_from_dir_namespaced` 等で stop_id/route_id/trip_id/service_id を
+    /// フィード単位で一意にしておくこと (このメソッド自体はマージするだけで、
+    /// ID の一意性検証は行わない)。
     pub fn build(feeds: &[Feed]) -> Result<Timetable> {
         // 1. 停留所の正規化 (parent_station への集約) と StopIdx 割り当て。
+        //    正規化後の StopId ごとに座標 (緯度経度の平均) も集計する
+        //    (近接駅の徒歩乗換判定に使う。実データはどのフィードも parent_station が
+        //    空なので通常は1駅1点の平均、フィクスチャのようにプラットフォームが
+        //    parent_station で束ねられる場合のみ複数点の平均になる)。
         let mut stop_ids: Vec<StopId> = Vec::new();
         let mut stop_lookup: HashMap<StopId, StopIdx> = HashMap::new();
         let mut canonical_of: HashMap<StopId, StopId> = HashMap::new();
+        let mut coord_acc: HashMap<StopId, (f64, f64, u32)> = HashMap::new();
 
         for feed in feeds {
             for stop in &feed.stops {
@@ -84,6 +130,11 @@ impl Timetable {
                 }
                 let idx = stop_lookup[&canonical];
                 stop_lookup.entry(stop.id.clone()).or_insert(idx);
+
+                let acc = coord_acc.entry(canonical).or_insert((0.0, 0.0, 0));
+                acc.0 += stop.lat;
+                acc.1 += stop.lng;
+                acc.2 += 1;
             }
         }
 
@@ -187,7 +238,43 @@ impl Timetable {
             }
         }
 
-        Ok(Timetable { stop_ids, stop_lookup, patterns, stop_patterns, calendars })
+        // 8. 乗換エッジの構築 (transfers.txt 非対応: 実測で都営/メトロ/りんかい/京王/
+        //    東武いずれのフィードにも transfers.txt が存在しないことを確認済み)。
+        //    - 自己ループ: 同一正規化停留所内の乗換に既定バッファを課す
+        //      (parent_station で束ねたプラットフォーム間、および同一 stop_id を
+        //      複数パターンが共有するケース, 例: 都営大江戸線 都庁前 のループ⇄放射線分岐)。
+        //    - 近接エッジ: 正規化停留所同士の直線距離が閾値以内なら、徒歩時間+バッファの
+        //      エッジを双方向に張る (同一事業者内の同名別プラットフォーム、および
+        //      フィードをまたぐ同一/隣接駅の乗換、例: 東京メトロ↔都営 白金高輪)。
+        let stop_coords: Vec<LatLng> = stop_ids
+            .iter()
+            .map(|id| {
+                let (lat_sum, lng_sum, n) = coord_acc.get(id).copied().unwrap_or((0.0, 0.0, 1));
+                LatLng::new(lat_sum / n.max(1) as f64, lng_sum / n.max(1) as f64)
+            })
+            .collect();
+
+        // 同一停留所内 (自己ループ) の乗換バッファは `transfers` に別エントリとして
+        // 持たず、`search` 側でパターン乗車チェック時に「直前ラベルが `Parent::Board`
+        // (=乗換無しでは同一停留所にそのまま留まっている) なら既定バッファを課す」
+        // 形で扱う (egress/到着時刻の報告にバッファを混ぜ込まないため。詳細は
+        // `search` 内のコメント参照)。ここで作るのは異なる正規化停留所間の
+        // 近接徒歩乗換エッジのみ。
+        let n = stop_ids.len();
+        let mut transfers: Vec<Vec<Transfer>> = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dist_m = stop_coords[i].haversine_m(&stop_coords[j]);
+                if dist_m <= MAX_WALK_TRANSFER_M {
+                    let walk_s = (dist_m / WALK_SPEED_MPS).ceil() as u32;
+                    let duration_s = walk_s + DEFAULT_TRANSFER_BUFFER_S;
+                    transfers[i].push(Transfer { to_stop: j as StopIdx, duration_s });
+                    transfers[j].push(Transfer { to_stop: i as StopIdx, duration_s });
+                }
+            }
+        }
+
+        Ok(Timetable { stop_ids, stop_lookup, patterns, stop_patterns, transfers, calendars })
     }
 
     /// GTFS 生 stop_id (プラットフォーム含む) または正規化済み StopId から StopIdx を引く。
@@ -295,6 +382,10 @@ enum Parent {
     /// `alight_pos` で降りた。乗車時に参照した「1ラウンド前のラベル」が属していたラウンドを
     /// `prev_round` に保持し、遡上時にどのラウンドを見ればよいか自己完結させる。
     Board { pattern: PatternIdx, trip_idx: usize, board_stop: StopIdx, board_pos: usize, alight_pos: usize, prev_round: usize },
+    /// 乗換エッジ (`Timetable::transfers`, 近接駅の徒歩乗換) を辿って `from_stop` から
+    /// 同一ラウンド内で到達した。同一ラウンド内の遷移なので `prev_round` は持たない
+    /// (遡上時は `cur_round` を変えずに `from_stop` へ移る)。
+    Transfer { from_stop: StopIdx, duration_s: u32 },
 }
 
 const INF: i64 = i64::MAX;
@@ -365,9 +456,19 @@ impl Timetable {
                         }
                     }
 
-                    let prev_arrival = prev[stop as usize].arrival;
+                    let prev_label = &prev[stop as usize];
+                    let prev_arrival = prev_label.arrival;
                     if prev_arrival != INF {
-                        if let Some(candidate) = earliest_catchable_trip(pattern, pos, prev_arrival, query.service_date, self) {
+                        // 直前ラベルが `Board` (=乗換エッジを経由せず同一停留所にそのまま
+                        // 留まっている) なら、同一停留所内乗換の既定バッファを課す。
+                        // `Access`/`Transfer` はそれぞれ「初回乗車」「乗換エッジの所要時間に
+                        // 既にバッファ込み」なので追加しない (二重計上を避ける)。
+                        let boarding_ready = prev_arrival
+                            + match prev_label.parent {
+                                Some(Parent::Board { .. }) => DEFAULT_TRANSFER_BUFFER_S as i64,
+                                _ => 0,
+                            };
+                        if let Some(candidate) = earliest_catchable_trip(pattern, pos, boarding_ready, query.service_date, self) {
                             let is_better = match boarded {
                                 None => true,
                                 Some((cur_trip, _)) => pattern.trips[candidate].departures[pos] < pattern.trips[cur_trip].departures[pos],
@@ -387,6 +488,35 @@ impl Timetable {
                     best[s as usize] = cur[s as usize].arrival;
                 }
             }
+
+            // 乗換緩和 (footpath relaxation): このラウンドで乗車により到達した停留所
+            // (`next_marked`) から、近接駅の徒歩乗換エッジを1ホップだけ辿る。連鎖乗換は
+            // しない (標準的な RAPTOR の footpath 前提に合わせる。徒歩を2回繋ぐより、
+            // 乗換エッジ自体を広く張る方が実態に合う)。
+            let mut transfer_marked: Vec<StopIdx> = Vec::new();
+            for &s in &next_marked {
+                let arrival_at_s = cur[s as usize].arrival;
+                if arrival_at_s == INF {
+                    continue;
+                }
+                for tr in &self.transfers[s as usize] {
+                    let target = tr.to_stop as usize;
+                    let candidate = arrival_at_s + tr.duration_s as i64;
+                    if candidate < best[target] && candidate < cur[target].arrival {
+                        cur[target] = Label { arrival: candidate, parent: Some(Parent::Transfer { from_stop: s, duration_s: tr.duration_s }) };
+                        transfer_marked.push(tr.to_stop);
+                    }
+                }
+            }
+            next_marked.extend(transfer_marked);
+            next_marked.sort_unstable();
+            next_marked.dedup();
+            for &s in &next_marked {
+                if cur[s as usize].arrival < best[s as usize] {
+                    best[s as usize] = cur[s as usize].arrival;
+                }
+            }
+
             rounds.push(cur);
             if next_marked.is_empty() {
                 break;
@@ -450,6 +580,13 @@ impl Timetable {
                     });
                     cur_stop = board_stop;
                     cur_round = prev_round;
+                }
+                Some(Parent::Transfer { from_stop, duration_s }) => {
+                    if duration_s > 0 {
+                        legs_rev.push(JourneyLeg::Walk { stop: cur_stop, duration_s });
+                    }
+                    cur_stop = from_stop;
+                    // 乗換エッジは同一ラウンド内の遷移: cur_round は変えない。
                 }
                 Some(Parent::Access) => {
                     if let Some(link) = query.access.iter().find(|l| l.stop == cur_stop) {

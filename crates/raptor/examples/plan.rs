@@ -1,46 +1,79 @@
 //! 本家 OTP との突き合わせ用の小さな CLI。
 //!
 //! `otp-rs/scripts/compare_otp.sh` から呼ばれる想定 (直接 `cargo run` してもよい)。
-//! 都営地下鉄 GTFS (`infra/otp/data/toei-train-gtfs.zip`) を読み込み、駅to駅の
-//! RAPTOR 探索結果を人間可読テキストで stdout に出す。
+//! 複数の鉄道 GTFS フィード (都営地下鉄・東京メトロ・りんかい線・京王・東武・
+//! 自前頻度 JR) を名前空間化して読み込み、駅to駅の RAPTOR 探索結果を人間可読テキストで
+//! stdout に出す。
+//!
+//! stop_id はフィード ID を前置した `"<feedId>:<rawStopId>"` 形式で指定する。
+//! フィード ID は babymobi の本家 OTP (`infra/otp`) が `feeds { feedId }` /
+//! `agencies { gtfsId }` で実際に採番している値と揃えてある (実測 2026-07-15,
+//! `curl -X POST :8080/otp/gtfs/v1 --data '{"query":"{ agencies { gtfsId name } }"}'`):
+//!   1=frequency-jr (自前頻度 GTFS, BMC-FREQ) / 2=twr (りんかい線) /
+//!   3=tokyometro (東京メトロ) / 4=keio (京王, チャレンジデータ) /
+//!   5=tobu (東武, チャレンジデータ) / 6=toei (都営地下鉄)
+//! こう揃えることで、本家 OTP の `stopLocationId` にそのまま同じ文字列を使い回して
+//! 突き合わせできる (`scripts/compare_otp.sh` 参照)。
 //!
 //! 使い方:
 //! ```sh
 //! cargo run -p otp-raptor --example plan -- <origin_stop_id> <dest_stop_id> <HH:MM> <YYYYMMDD>
-//! # 例: cargo run -p otp-raptor --example plan -- 428 409 08:00 20260713
+//! # 例 (都営単一フィード内): 6:428 6:409 08:00 20260713
+//! # 例 (メトロ→都営の乗換): 3:805 6:204 08:00 20260713
 //! ```
-//! GTFS の在り処は otp-gtfs の実データテストと同じ規約 (`OTP_RS_GTFS_DIR` /
-//! `OTP_RS_GTFS_ZIP` 環境変数、既定は `../../../infra/otp/data/toei-train-gtfs.zip`)。
+//! GTFS の在り処は otp-gtfs の実データテストと同じ規約
+//! (既定は `../../../infra/otp/data/<feed>.zip`)。`OTP_RS_GTFS_DATA_DIR` で
+//! zip の置き場所を丸ごと差し替えられる。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use otp_gtfs::Feed;
 use otp_raptor::{RaptorQuery, StreetLink, Timetable};
 
-fn default_zip_path() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../infra/otp/data/toei-train-gtfs.zip"))
+/// (フィードID, zipファイル名)。本家 OTP の feedId 割り当てと揃えてある (モジュール doc 参照)。
+const FEEDS: &[(&str, &str)] = &[
+    ("1", "frequency-jr-gtfs.zip"),
+    ("2", "twr-train-gtfs.zip"),
+    ("3", "tokyometro-train-gtfs.zip"),
+    ("4", "challenge-keio-train-gtfs.zip"),
+    ("5", "challenge-tobu-train-gtfs.zip"),
+    ("6", "toei-train-gtfs.zip"),
+];
+
+fn data_dir() -> PathBuf {
+    std::env::var("OTP_RS_GTFS_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../infra/otp/data")))
 }
 
-fn prepare_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("OTP_RS_GTFS_DIR") {
-        return PathBuf::from(dir);
-    }
-    let zip_path = std::env::var("OTP_RS_GTFS_ZIP").map(PathBuf::from).unwrap_or_else(|_| default_zip_path());
+fn prepare_feed_dir(feed_prefix: &str, zip_path: &Path) -> PathBuf {
     if !zip_path.is_file() {
-        eprintln!("GTFS zip が見つかりません: {}", zip_path.display());
+        eprintln!("GTFS zip が見つかりません: {} (feed={feed_prefix})", zip_path.display());
         std::process::exit(1);
     }
-    let out_dir = std::env::temp_dir().join("otp-rs-toei-gtfs-test");
+    let out_dir = std::env::temp_dir().join(format!("otp-rs-plan-gtfs-{feed_prefix}"));
     if !(out_dir.join("stops.txt").is_file() && out_dir.join("stop_times.txt").is_file()) {
         std::fs::create_dir_all(&out_dir).unwrap();
-        let status = Command::new("unzip").arg("-o").arg("-q").arg(&zip_path).arg("-d").arg(&out_dir).status().unwrap();
+        let status = Command::new("unzip").arg("-o").arg("-q").arg(zip_path).arg("-d").arg(&out_dir).status().unwrap();
         if !status.success() {
-            eprintln!("unzip 失敗");
+            eprintln!("unzip 失敗 (feed={feed_prefix})");
             std::process::exit(1);
         }
     }
     out_dir
+}
+
+fn load_all_feeds() -> Vec<Feed> {
+    let dir = data_dir();
+    FEEDS
+        .iter()
+        .map(|(prefix, filename)| {
+            let zip_path = dir.join(filename);
+            let feed_dir = prepare_feed_dir(prefix, &zip_path);
+            Feed::load_from_dir_namespaced(&feed_dir, prefix).unwrap_or_else(|e| panic!("feed {prefix} load failed: {e}"))
+        })
+        .collect()
 }
 
 fn parse_hhmm(s: &str) -> i32 {
@@ -52,6 +85,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
         eprintln!("usage: plan <origin_stop_id> <dest_stop_id> <HH:MM> <YYYYMMDD>");
+        eprintln!("  stop_id はフィードID前置 (例: 6:428 = 都営 新宿, 3:805 = メトロ 六本木一丁目)");
         std::process::exit(1);
     }
     let origin_id = &args[1];
@@ -59,9 +93,8 @@ fn main() {
     let earliest_departure = parse_hhmm(&args[3]);
     let service_date: u32 = args[4].parse().expect("YYYYMMDD");
 
-    let dir = prepare_data_dir();
-    let feed = Feed::load_from_dir(&dir).expect("feed load failed");
-    let tt = Timetable::build(std::slice::from_ref(&feed)).expect("timetable build failed");
+    let feeds = load_all_feeds();
+    let tt = Timetable::build(&feeds).expect("timetable build failed");
 
     let origin = tt.stop_idx(&otp_core::StopId::new(origin_id.as_str())).unwrap_or_else(|| panic!("origin stop {origin_id} not found"));
     let dest = tt.stop_idx(&otp_core::StopId::new(dest_id.as_str())).unwrap_or_else(|| panic!("dest stop {dest_id} not found"));

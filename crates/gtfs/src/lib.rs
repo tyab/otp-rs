@@ -179,6 +179,55 @@ impl Feed {
             fare_rules: parse_fare_rules(&fare_rules)?,
         })
     }
+
+    /// 複数フィード統合用: `feed_prefix` を `"<feed_prefix>:<id>"` の形で
+    /// stop_id/route_id/trip_id/service_id (および相互参照列: `parent_station`,
+    /// `trips.route_id`/`trips.service_id`, `stop_times` の trip_id/stop_id,
+    /// `fare_rules.route_id`) に前置して読み込む。
+    ///
+    /// 実測 (babymobi infra/otp/data): 都営・メトロ・京王・東武・りんかいの GTFS は
+    /// いずれも `route_id`/`service_id` が事業者間で "0"〜"4" 等の小さい整数を再利用
+    /// している (例: どのフィードも route_id="1".."4" を持つ)。素朴に複数 `Feed` を
+    /// `Timetable::build` に渡すと、`ServiceId`/`RouteId` をキーにした `HashMap` が
+    /// 別事業者のエントリを上書きし、カレンダー判定や路線パターン化が壊れる。
+    /// このため複数フィードを1つの `Timetable` にまとめる際は必ずこちらを使う。
+    pub fn load_from_dir_namespaced(dir: &std::path::Path, feed_prefix: &str) -> Result<Feed> {
+        let mut feed = Self::load_from_dir(dir)?;
+        feed.namespace(feed_prefix);
+        Ok(feed)
+    }
+
+    /// 読み込み済みの `Feed` に事後的に名前空間を適用する (`load_from_dir_namespaced`
+    /// が使う本体。テスト等で読み込み後に適用したい場合にも公開する)。
+    pub fn namespace(&mut self, feed_prefix: &str) {
+        let ns = |id: &str| -> String { format!("{feed_prefix}:{id}") };
+
+        for s in &mut self.stops {
+            s.id = StopId::new(ns(s.id.as_str()));
+            s.parent_station = s.parent_station.take().map(|p| StopId::new(ns(p.as_str())));
+        }
+        for r in &mut self.routes {
+            r.id = RouteId::new(ns(r.id.as_str()));
+        }
+        for t in &mut self.trips {
+            t.id = TripId::new(ns(t.id.as_str()));
+            t.route_id = RouteId::new(ns(t.route_id.as_str()));
+            t.service_id = ServiceId::new(ns(t.service_id.as_str()));
+        }
+        for st in &mut self.stop_times {
+            st.trip_id = TripId::new(ns(st.trip_id.as_str()));
+            st.stop_id = StopId::new(ns(st.stop_id.as_str()));
+        }
+        for c in &mut self.calendars {
+            c.service_id = ServiceId::new(ns(c.service_id.as_str()));
+        }
+        for cd in &mut self.calendar_dates {
+            cd.service_id = ServiceId::new(ns(cd.service_id.as_str()));
+        }
+        for fr in &mut self.fare_rules {
+            fr.route_id = fr.route_id.take().map(|r| RouteId::new(ns(r.as_str())));
+        }
+    }
 }
 
 /// GTFS ディレクトリから1テーブルを読む。ファイルが存在しなければ空テーブル
@@ -488,5 +537,41 @@ mod tests {
     #[test]
     fn wheelchair_default_is_unknown() {
         assert_eq!(WheelchairBoarding::default(), WheelchairBoarding::Unknown);
+    }
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mini"))
+    }
+
+    #[test]
+    fn namespace_prefixes_ids_and_keeps_cross_refs_consistent() {
+        let feed = Feed::load_from_dir_namespaced(&fixture_dir(), "toei").expect("mini fixture should load");
+
+        // stop_id と parent_station が両方とも前置され、対応関係は保たれる。
+        let c1 = feed.stops.iter().find(|s| s.id.as_str() == "toei:C1").expect("C1 should be namespaced");
+        assert_eq!(c1.parent_station.as_ref().map(|p| p.as_str()), Some("toei:C"));
+
+        // trips の route_id/service_id、stop_times の trip_id/stop_id も前置される。
+        let t1 = feed.trips.iter().find(|t| t.id.as_str() == "toei:T1").expect("T1 should be namespaced");
+        assert_eq!(t1.route_id.as_str(), "toei:R1");
+        assert_eq!(t1.service_id.as_str(), "toei:WD");
+        assert!(feed.stop_times.iter().any(|st| st.trip_id.as_str() == "toei:T1" && st.stop_id.as_str() == "toei:A"));
+
+        // calendar / calendar_dates の service_id も前置される。
+        assert!(feed.calendars.iter().any(|c| c.service_id.as_str() == "toei:WD"));
+        assert!(feed.calendar_dates.iter().any(|cd| cd.service_id.as_str() == "toei:WD"));
+    }
+
+    #[test]
+    fn namespace_prevents_cross_feed_id_collisions() {
+        // 実測: 都営/メトロ等の GTFS は route_id/service_id に "0" 等の小さい整数を
+        // 事業者間で使い回す。名前空間化すればフィード間で衝突しないことを確認する。
+        let mut a = Feed::load_from_dir(&fixture_dir()).expect("mini fixture should load");
+        let mut b = Feed::load_from_dir(&fixture_dir()).expect("mini fixture should load");
+        a.namespace("feedA");
+        b.namespace("feedB");
+        let a_routes: std::collections::HashSet<&str> = a.routes.iter().map(|r| r.id.as_str()).collect();
+        let b_routes: std::collections::HashSet<&str> = b.routes.iter().map(|r| r.id.as_str()).collect();
+        assert!(a_routes.is_disjoint(&b_routes), "namespaced route_id should not collide across feeds");
     }
 }

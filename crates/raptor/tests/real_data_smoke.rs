@@ -92,3 +92,49 @@ fn shinjuku_to_hongo_sanchome_returns_sane_journey() {
         eprintln!("  {leg:?}");
     }
 }
+
+/// 都庁前乗換 (新宿→本郷三丁目, 都営大江戸線のループ区間⇄放射区間) の乗換バッファ
+/// 検証。実測 (2026-07-15, 本家 OTP `planConnection`, stopLocationId `6:428`→`6:409`,
+/// 2026-07-13T08:00 発): OTP は 08:05発→08:25着 (乗換1回, 都庁前で2分=120秒接続)。
+/// 導入前の RAPTOR (0分乗換モデル) は 08:01発→08:21着 で本家と4分の差があった
+/// (`scripts/compare_otp.sh` 旧コメント参照)。既定バッファ (120秒) 導入後は
+/// 08:01発→08:25着 となり、到着時刻が本家と完全一致することを固定する回帰テスト。
+#[test]
+fn shinjuku_to_hongo_sanchome_transfer_respects_default_buffer() {
+    let Some(dir) = prepare_data_dir() else { return };
+    let feed = Feed::load_from_dir(&dir).expect("実データ feed のロードに失敗");
+    let tt = Timetable::build(std::slice::from_ref(&feed)).expect("timetable should build");
+
+    let shinjuku = tt.stop_idx(&otp_core::StopId::new("428")).expect("新宿 (428) が時刻表に無い");
+    let hongo = tt.stop_idx(&otp_core::StopId::new("409")).expect("本郷三丁目 (409) が時刻表に無い");
+
+    let query = RaptorQuery {
+        access: vec![StreetLink { stop: shinjuku, duration_s: 0 }],
+        egress: vec![StreetLink { stop: hongo, duration_s: 0 }],
+        earliest_departure: 8 * 3600,
+        service_date: 20260713,
+        max_rounds: 4,
+    };
+
+    let journeys = tt.search(&query).expect("search should not panic/error");
+    let best = journeys.last().expect("経路が見つからなかった");
+
+    assert_eq!(best.transfers, 1, "都庁前で1回乗換のはず: {best:?}");
+    assert_eq!(best.arrival_s, 8 * 3600 + 25 * 60, "本家 OTP 実測 (08:25着) と一致するはず: {best:?}");
+
+    let transit_legs: Vec<_> = best
+        .legs
+        .iter()
+        .filter_map(|l| match l {
+            otp_raptor::JourneyLeg::Transit { board_s, alight_s, .. } => Some((*board_s, *alight_s)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(transit_legs.len(), 2, "大江戸線を2本乗り継ぐはず: {transit_legs:?}");
+    let (_, first_alight) = transit_legs[0];
+    let (second_board, _) = transit_legs[1];
+    assert!(
+        second_board >= first_alight + 120,
+        "都庁前での乗換は既定バッファ120秒以上あくはず: alight={first_alight} board={second_board}"
+    );
+}
