@@ -1,0 +1,6 @@
+route_id,service_id,trip_id
+R1,WD,T1
+R1,WD,T1B
+R2,WD_EXTRA,T2
+R2,WD_EXTRA,T2E
+R3,WD,T3_bus

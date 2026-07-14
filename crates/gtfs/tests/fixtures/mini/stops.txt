@@ -1,0 +1,7 @@
+﻿stop_id,stop_name,stop_lat,stop_lon,parent_station,wheelchair_boarding
+A,A駅,35.00,139.00,,
+B,B駅,35.01,139.01,,
+C1,C駅1番線,35.02,139.02,C,1
+C2,C駅2番線,35.02,139.02,C,1
+C,C駅,35.02,139.02,,
+D,D駅,35.03,139.03,,2

@@ -1,0 +1,4 @@
+route_id,route_short_name,route_long_name,route_type
+R1,R1,"Rapid ""Local"" Line, North",1
+R2,R2,South Rail Line,2
+R3,R3,City Bus Line,3
