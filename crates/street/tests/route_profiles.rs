@@ -99,3 +99,39 @@ fn wheelchair_and_stroller_route_diverges_from_normal() {
         "wheelchair should take longer on the same detour due to slower speed"
     );
 }
+
+#[test]
+fn physical_duration_s_is_wall_clock_time_and_diverges_from_generalized_cost_on_stairs() {
+    // normal profile は階段直行 (has_stairs=true) を選ぶ。stairs_reluctance=1.0 なので
+    // duration_s (一般化コスト) と physical_duration_s (壁時計時間) は一致するはず。
+    let graph = StreetGraph::build_from_osm_xml(&fixture_path("profile_routes.osm"))
+        .expect("fixture should build");
+    let normal = graph.route(ORIGIN, DEST, &WalkProfile::normal()).unwrap();
+    assert!(normal.has_stairs);
+    let expected_physical = normal.distance_m / WalkProfile::normal().speed_mps;
+    assert!(
+        (normal.physical_duration_s - expected_physical).abs() < 0.01,
+        "physical_duration_s ({}) should equal distance/speed ({})",
+        normal.physical_duration_s,
+        expected_physical
+    );
+    assert!(
+        (normal.physical_duration_s - normal.duration_s).abs() < 0.01,
+        "stairs_reluctance=1.0 のnormalでは一般化コストと壁時計時間が一致するはず"
+    );
+
+    // stroller profile は階段を避けて迂回 (has_stairs=false) を選ぶが、stairs_reluctance
+    // が高いため経路選択自体には階段忌避が効いている。選ばれた迂回路には階段が
+    // 無いので、この経路上では duration_s (一般化コスト) と physical_duration_s
+    // (壁時計時間) は速度以外のペナルティが乗らず一致するはず
+    // (unknown_cost はこのフィクスチャの迂回路が wheelchair=yes 明示なので掛からない)。
+    let stroller = graph.route(ORIGIN, DEST, &WalkProfile::stroller()).unwrap();
+    assert!(!stroller.has_stairs);
+    let expected_stroller_physical = stroller.distance_m / WalkProfile::stroller().speed_mps;
+    assert!(
+        (stroller.physical_duration_s - expected_stroller_physical).abs() < 0.01,
+        "physical_duration_s ({}) should equal distance/speed ({})",
+        stroller.physical_duration_s,
+        expected_stroller_physical
+    );
+}

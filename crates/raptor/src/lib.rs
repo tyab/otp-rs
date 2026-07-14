@@ -99,6 +99,9 @@ pub struct Timetable {
     /// StopIdx → 乗換エッジ一覧 (自己バッファ + 近接駅徒歩乗換)。
     transfers: Vec<Vec<Transfer>>,
     calendars: HashMap<otp_core::ServiceId, ServiceCalendar>,
+    /// StopIdx → 正規化停留所の座標 (同一正規化停留所に属す生 stop の平均)。
+    /// otp-engine が「座標 → 近傍駅」を引く (`nearby_stops`) ためにここで保持する。
+    stop_coords: Vec<LatLng>,
 }
 
 impl Timetable {
@@ -274,12 +277,35 @@ impl Timetable {
             }
         }
 
-        Ok(Timetable { stop_ids, stop_lookup, patterns, stop_patterns, transfers, calendars })
+        Ok(Timetable { stop_ids, stop_lookup, patterns, stop_patterns, transfers, calendars, stop_coords })
     }
 
     /// GTFS 生 stop_id (プラットフォーム含む) または正規化済み StopId から StopIdx を引く。
     pub fn stop_idx(&self, stop_id: &StopId) -> Option<StopIdx> {
         self.stop_lookup.get(stop_id).copied()
+    }
+
+    /// StopIdx → 座標。
+    pub fn stop_coord(&self, stop: StopIdx) -> LatLng {
+        self.stop_coords[stop as usize]
+    }
+
+    /// `coord` から直線距離 `radius_m` 以内の停留所を、近い順に返す。
+    ///
+    /// otp-engine の access/egress 徒歩探索の候補駅集めに使う (`Engine::plan`)。
+    /// 停留所数に対して線形探索 (東京都心規模の駅数なら十分高速。広域化する
+    /// 場合はグリッド索引への切り替えを検討: `otp-street::nearest_node` の
+    /// コメント参照)。
+    pub fn nearby_stops(&self, coord: LatLng, radius_m: f64) -> Vec<(StopIdx, LatLng)> {
+        let mut found: Vec<(StopIdx, LatLng, f64)> = self
+            .stop_coords
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i as StopIdx, c, coord.haversine_m(&c)))
+            .filter(|&(_, _, d)| d <= radius_m)
+            .collect();
+        found.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        found.into_iter().map(|(i, c, _)| (i, c)).collect()
     }
 
     fn service_active(&self, service_id: &otp_core::ServiceId, date: u32) -> bool {
@@ -703,6 +729,17 @@ mod tests {
         assert_eq!(transit_legs.len(), 2);
         assert_eq!(transit_legs[0], ("T1".to_string(), 8 * 3600, 8 * 3600 + 600));
         assert_eq!(transit_legs[1], ("T2".to_string(), 8 * 3600 + 1200, 8 * 3600 + 1800));
+    }
+
+    #[test]
+    fn nearby_stops_finds_close_stops_sorted_by_distance_and_excludes_far_ones() {
+        let tt = load();
+        // 実測 (haversine): A-B ≈ 1437m, A-C ≈ 2875m, A-D ≈ 4312m。
+        let a_coord = tt.stop_coord(tt.stop_idx(&StopId::new("A")).unwrap());
+        let found = tt.nearby_stops(a_coord, 2000.0);
+
+        let ids: Vec<&str> = found.iter().map(|(idx, _)| tt.stop_ids[*idx as usize].as_str()).collect();
+        assert_eq!(ids, vec!["A", "B"], "2km以内はA自身とBのみのはず (C以遠は除外)");
     }
 
     #[test]

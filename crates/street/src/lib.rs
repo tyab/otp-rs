@@ -309,6 +309,7 @@ impl StreetGraph {
                 nodes: vec![start],
                 distance_m: 0.0,
                 duration_s: 0.0,
+                physical_duration_s: 0.0,
                 has_stairs: false,
             });
         }
@@ -327,7 +328,9 @@ impl StreetGraph {
 
         while let Some(HeapItem { node: current, .. }) = open.pop() {
             if current == goal {
-                return Ok(self.reconstruct_path(goal, &came_from, &g_score));
+                let mut path = self.reconstruct_path(goal, &came_from, &g_score);
+                path.physical_duration_s = path.distance_m / profile.speed_mps;
+                return Ok(path);
             }
             if closed[current as usize] {
                 continue;
@@ -379,6 +382,7 @@ impl StreetGraph {
             nodes,
             distance_m,
             duration_s: g_score[goal as usize],
+            physical_duration_s: 0.0, // route() が呼び出し後に埋める (ここでは profile を持たない)
             has_stairs,
         }
     }
@@ -417,7 +421,15 @@ fn heuristic(from: LatLng, goal: LatLng, profile: &WalkProfile) -> f32 {
 pub struct WalkPath {
     pub nodes: Vec<NodeId>,
     pub distance_m: f32,
+    /// 探索用の一般化コスト (秒相当)。階段忌避・不明ペナルティ・勾配ペナルティの
+    /// 乗数が織り込まれており、実際の壁時計時間ではない (`edge_cost` 参照)。
+    /// A* の最適性判定・経路選択にはこちらを使う。
     pub duration_s: f32,
+    /// 実際の壁時計所要時間 (秒) = `distance_m / profile.speed_mps`。
+    /// UI表示や otp-engine の RAPTOR access/egress 秒数 (`StreetLink::duration_s`)
+    /// にはこちらを使う (`duration_s` はペナルティ込みで実時間より長く出るため
+    /// そのまま使うと乗り遅れ判定等がずれる)。
+    pub physical_duration_s: f32,
     /// 経路に階段が含まれるか (UI の警告用)。
     pub has_stairs: bool,
 }
