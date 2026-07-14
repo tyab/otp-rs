@@ -1,0 +1,56 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+  手作りの最小フィクスチャ。プロファイル (通常/ベビーカー/車いす) によって
+  A* が選ぶ経路が変わることを検証する (otp-street の核心)。
+
+  ノード1 (出発) -> ノード2 (到着) への経路が2通りある:
+    - way 101 (highway=steps): 1 -> 2 の直行, 約100m, 階段あり
+    - way 102+103 (highway=footway, wheelchair=yes): 1 -> 3 -> 2 の迂回, 合計 約250m, 階段なし
+
+  加えて「フィルタで除外されるべき道」を2本混ぜてある (もし誤って含まれたら
+  ほぼ0mの近道になり、どのプロファイルでもそちらが選ばれてしまうため、
+  除外できていないと即座にテストが落ちる):
+    - way 104 (highway=motorway): 1 -> 4 -> 2 (自動車専用、歩行不可)
+    - way 105 (highway=residential + foot=no): 1 -> 5 -> 2 (歩行者通行禁止)
+-->
+<osm version="0.6" generator="otp-rs-fixture">
+  <node id="1" lat="35.69000" lon="139.70000"/>
+  <node id="2" lat="35.69090" lon="139.70000"/>
+  <node id="3" lat="35.69000" lon="139.70120"/>
+  <node id="4" lat="35.69090" lon="139.70000"/>
+  <node id="5" lat="35.69090" lon="139.70000"/>
+
+  <way id="101">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <tag k="highway" v="steps"/>
+  </way>
+
+  <way id="102">
+    <nd ref="1"/>
+    <nd ref="3"/>
+    <tag k="highway" v="footway"/>
+    <tag k="wheelchair" v="yes"/>
+  </way>
+  <way id="103">
+    <nd ref="3"/>
+    <nd ref="2"/>
+    <tag k="highway" v="footway"/>
+    <tag k="wheelchair" v="yes"/>
+  </way>
+
+  <way id="104">
+    <nd ref="1"/>
+    <nd ref="4"/>
+    <nd ref="2"/>
+    <tag k="highway" v="motorway"/>
+  </way>
+
+  <way id="105">
+    <nd ref="1"/>
+    <nd ref="5"/>
+    <nd ref="2"/>
+    <tag k="highway" v="residential"/>
+    <tag k="foot" v="no"/>
+  </way>
+</osm>

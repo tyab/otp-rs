@@ -1,0 +1,112 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+  アクセシビリティ属性の抽出 (has_stairs / has_elevator / wheelchair / max_slope_pct)
+  と、歩行不可 way の除外ルールを検証するためのフィクスチャ。
+  各 way は独立した2ノードの短い区間で、座標帯で区別できるようにしてある
+  (lon を 0.0001 ずつずらす。1way = 1区間、他 way と共有ノード無し)。
+-->
+<osm version="0.6" generator="otp-rs-fixture">
+  <node id="1" lat="35.70000" lon="139.70000"/>
+  <node id="2" lat="35.70010" lon="139.70000"/>
+  <way id="201">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <tag k="highway" v="steps"/>
+  </way>
+
+  <node id="3" lat="35.70000" lon="139.70010"/>
+  <node id="4" lat="35.70010" lon="139.70010"/>
+  <way id="202">
+    <nd ref="3"/>
+    <nd ref="4"/>
+    <tag k="highway" v="elevator"/>
+  </way>
+
+  <node id="5" lat="35.70000" lon="139.70020"/>
+  <node id="6" lat="35.70010" lon="139.70020"/>
+  <way id="203">
+    <nd ref="5"/>
+    <nd ref="6"/>
+    <tag k="highway" v="footway"/>
+    <tag k="elevator" v="yes"/>
+  </way>
+
+  <node id="7" lat="35.70000" lon="139.70030"/>
+  <node id="8" lat="35.70010" lon="139.70030"/>
+  <way id="204">
+    <nd ref="7"/>
+    <nd ref="8"/>
+    <tag k="highway" v="footway"/>
+    <tag k="wheelchair" v="yes"/>
+  </way>
+
+  <node id="9" lat="35.70000" lon="139.70040"/>
+  <node id="10" lat="35.70010" lon="139.70040"/>
+  <way id="205">
+    <nd ref="9"/>
+    <nd ref="10"/>
+    <tag k="highway" v="footway"/>
+    <tag k="wheelchair" v="no"/>
+  </way>
+
+  <node id="11" lat="35.70000" lon="139.70050"/>
+  <node id="12" lat="35.70010" lon="139.70050"/>
+  <way id="206">
+    <nd ref="11"/>
+    <nd ref="12"/>
+    <tag k="highway" v="footway"/>
+    <tag k="wheelchair" v="limited"/>
+  </way>
+
+  <node id="13" lat="35.70000" lon="139.70060"/>
+  <node id="14" lat="35.70010" lon="139.70060"/>
+  <way id="207">
+    <nd ref="13"/>
+    <nd ref="14"/>
+    <tag k="highway" v="footway"/>
+    <tag k="incline" v="8%"/>
+  </way>
+
+  <node id="15" lat="35.70000" lon="139.70070"/>
+  <node id="16" lat="35.70010" lon="139.70070"/>
+  <way id="208">
+    <nd ref="15"/>
+    <nd ref="16"/>
+    <tag k="highway" v="footway"/>
+    <tag k="incline" v="-10%"/>
+  </way>
+
+  <node id="17" lat="35.70000" lon="139.70080"/>
+  <node id="18" lat="35.70010" lon="139.70080"/>
+  <way id="209">
+    <nd ref="17"/>
+    <nd ref="18"/>
+    <tag k="highway" v="footway"/>
+    <tag k="incline" v="up"/>
+  </way>
+
+  <node id="19" lat="35.70000" lon="139.70090"/>
+  <node id="20" lat="35.70010" lon="139.70090"/>
+  <way id="210">
+    <nd ref="19"/>
+    <nd ref="20"/>
+    <tag k="highway" v="motorway"/>
+  </way>
+
+  <node id="21" lat="35.70000" lon="139.70100"/>
+  <node id="22" lat="35.70010" lon="139.70100"/>
+  <way id="211">
+    <nd ref="21"/>
+    <nd ref="22"/>
+    <tag k="highway" v="residential"/>
+    <tag k="foot" v="no"/>
+  </way>
+
+  <node id="23" lat="35.70000" lon="139.70110"/>
+  <node id="24" lat="35.70010" lon="139.70110"/>
+  <way id="212">
+    <nd ref="23"/>
+    <nd ref="24"/>
+    <tag k="highway" v="cycleway"/>
+  </way>
+</osm>

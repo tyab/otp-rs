@@ -76,13 +76,25 @@ impl Engine {
         timetable: otp_raptor::Timetable,
         fares: otp_fares::FareModel,
     ) -> Self {
-        Self { street, timetable, fares }
+        Self {
+            street,
+            timetable,
+            fares,
+        }
     }
 
     /// 経路探索。
     ///
     /// TODO(移植): access/egress 徒歩探索 → RAPTOR → 運賃 → Itinerary 組み立て。
     /// まず「徒歩+鉄道1本」の最小ケースを通し、本家 OTP と突き合わせる。
+    ///
+    /// otp-street 側の準備は済んでいる: `self.street.route(from, to,
+    /// &req.mobility.walk_profile())` が `WalkPath { nodes, distance_m,
+    /// duration_s, has_stairs }` を返すので、access (出発地→最寄駅) と egress
+    /// (最寄駅→目的地) はそれぞれ1回ずつ呼べば済む形になっている。駅の座標は
+    /// `otp_raptor::Timetable` 側から引く必要があり (現状 stop_id ベースなので
+    /// 座標を持たせるか別マッピングが要る)、そこが次スライスの最初の課題。
+    /// `has_stairs` は `Leg::Walk` にそのまま渡せる。
     pub fn plan(&self, _req: &RouteRequest) -> Result<Vec<Itinerary>> {
         Err(otp_core::Error::Unimplemented("Engine::plan"))
     }
@@ -94,6 +106,9 @@ mod tests {
 
     #[test]
     fn mobility_maps_to_profile() {
-        assert_eq!(Mobility::Stroller.walk_profile().stairs_reluctance, WalkProfile::stroller().stairs_reluctance);
+        assert_eq!(
+            Mobility::Stroller.walk_profile().stairs_reluctance,
+            WalkProfile::stroller().stairs_reluctance
+        );
     }
 }
