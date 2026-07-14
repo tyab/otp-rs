@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# 将来の Wasm 境界クレート用 (engine を wasm32 で使う布石)。今は未使用。
+targets = ["wasm32-unknown-unknown"]

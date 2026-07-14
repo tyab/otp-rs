@@ -1,0 +1,11 @@
+[package]
+name = "otp-fares"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "運賃計算 (GTFS-Fares v1、将来 v2 / JR 距離制)"
+
+[dependencies]
+otp-core = { path = "../core" }
+otp-gtfs = { path = "../gtfs" }

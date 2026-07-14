@@ -1,0 +1,11 @@
+[package]
+name = "otp-raptor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RAPTOR マルチモーダル乗換探索"
+
+[dependencies]
+otp-core = { path = "../core" }
+otp-gtfs = { path = "../gtfs" }

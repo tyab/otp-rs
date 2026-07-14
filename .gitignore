@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+# 大容量の入力/生成データはコミットしない (babymobi 側の infra/otp/data から供給する)
+/data
+*.osm.pbf
+*.zip
+graph.bin

@@ -1,0 +1,14 @@
+[package]
+name = "otp-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "統合経路探索 (アクセス徒歩→乗換→イグレス徒歩→運賃→結果)"
+
+[dependencies]
+otp-core = { path = "../core" }
+otp-gtfs = { path = "../gtfs" }
+otp-street = { path = "../street" }
+otp-raptor = { path = "../raptor" }
+otp-fares = { path = "../fares" }

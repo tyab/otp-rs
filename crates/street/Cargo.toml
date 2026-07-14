@@ -1,0 +1,10 @@
+[package]
+name = "otp-street"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OSM 街路グラフ + 歩行ルーティング + ベビーカー/車いすアクセシビリティ・コスト"
+
+[dependencies]
+otp-core = { path = "../core" }

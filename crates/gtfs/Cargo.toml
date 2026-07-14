@@ -1,0 +1,10 @@
+[package]
+name = "otp-gtfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GTFS 取り込み + 交通モデル + 運賃データ (GTFS-Fares v1)"
+
+[dependencies]
+otp-core = { path = "../core" }

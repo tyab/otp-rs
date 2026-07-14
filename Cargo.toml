@@ -1,0 +1,28 @@
+# otp-rs — OpenTripPlanner の Rust 移植 (workspace ルート)
+#
+# 長期目標: OTP2 (Java) の完全移植。短期: Baby Mobility Commons が必要とする
+# 「徒歩+鉄道/バスのマルチモーダル経路 + ベビーカー(車いす)アクセシビリティ +
+# 運賃 + GTFS/OSM 取り込み」を先に実装する。
+#
+# クレート構成は OTP のサブシステム対応で分割している (README.md 参照)。
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/gtfs",
+    "crates/street",
+    "crates/raptor",
+    "crates/fares",
+    "crates/engine",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "LGPL-3.0-or-later" # OTP 本体と同じ (移植のため踏襲)
+repository = "https://github.com/tyab/otp-rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
