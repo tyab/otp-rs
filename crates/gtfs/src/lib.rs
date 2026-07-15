@@ -102,6 +102,19 @@ pub struct StopTime {
     pub departure: SecondsSinceMidnight,
 }
 
+/// `frequencies.txt` の1行。1本の雛形 trip (その stop_times は先頭発を基準とした相対時刻)
+/// を `[start_time, end_time)` の間 `headway_secs` 間隔で反復運行する頻度ベースダイヤを表す。
+/// 自前頻度 GTFS (JR・私鉄・京王・東武, agency=BMC-FREQ) がこの形式を使う。
+#[derive(Debug, Clone)]
+pub struct Frequency {
+    pub trip_id: TripId,
+    pub start_time: SecondsSinceMidnight,
+    pub end_time: SecondsSinceMidnight,
+    pub headway_secs: u32,
+    /// 0=頻度ベース(間隔運行)、1=スケジュールベース(各発が確定時刻)。展開処理は同じ。
+    pub exact_times: u8,
+}
+
 /// 運行日 (`calendar.txt`)。曜日ビットと有効期間。
 #[derive(Debug, Clone)]
 pub struct Calendar {
@@ -157,6 +170,7 @@ pub struct Feed {
     pub calendar_dates: Vec<CalendarDate>,
     pub fare_attributes: Vec<FareAttribute>,
     pub fare_rules: Vec<FareRule>,
+    pub frequencies: Vec<Frequency>,
 }
 
 impl Feed {
@@ -173,6 +187,7 @@ impl Feed {
         let calendar_dates = load_table(dir, "calendar_dates.txt")?;
         let fare_attributes = load_table(dir, "fare_attributes.txt")?;
         let fare_rules = load_table(dir, "fare_rules.txt")?;
+        let frequencies = load_table(dir, "frequencies.txt")?;
 
         Ok(Feed {
             stops: parse_stops(&stops)?,
@@ -183,6 +198,7 @@ impl Feed {
             calendar_dates: parse_calendar_dates(&calendar_dates)?,
             fare_attributes: parse_fare_attributes(&fare_attributes)?,
             fare_rules: parse_fare_rules(&fare_rules)?,
+            frequencies: parse_frequencies(&frequencies)?,
         })
     }
 
@@ -244,6 +260,9 @@ impl Feed {
             fr.origin_id = fr.origin_id.take().map(|z| ns(&z));
             fr.destination_id = fr.destination_id.take().map(|z| ns(&z));
             fr.contains_id = fr.contains_id.take().map(|z| ns(&z));
+        }
+        for f in &mut self.frequencies {
+            f.trip_id = TripId::new(ns(f.trip_id.as_str()));
         }
     }
 }
@@ -495,6 +514,22 @@ fn parse_calendar_dates(t: &Table) -> Result<Vec<CalendarDate>> {
         .collect()
 }
 
+fn parse_frequencies(t: &Table) -> Result<Vec<Frequency>> {
+    t.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let trip_id = required(&row, "frequencies.txt", i, "trip_id")?;
+            let start_time = parse_gtfs_time(required(&row, "frequencies.txt", i, "start_time")?)?;
+            let end_time = parse_gtfs_time(required(&row, "frequencies.txt", i, "end_time")?)?;
+            let headway_secs: u32 = required(&row, "frequencies.txt", i, "headway_secs")?
+                .parse()
+                .map_err(|_| Error::Parse(format!("frequencies.txt row {i}: bad headway_secs")))?;
+            let exact_times = row.get("exact_times").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+            Ok(Frequency { trip_id: TripId::new(trip_id), start_time, end_time, headway_secs, exact_times })
+        })
+        .collect()
+}
+
 fn parse_fare_attributes(t: &Table) -> Result<Vec<FareAttribute>> {
     t.iter()
         .enumerate()
@@ -609,6 +644,31 @@ mod tests {
         assert_eq!(rule.origin_id.as_deref(), Some("toei:900"));
         assert_eq!(rule.destination_id.as_deref(), Some("toei:901"));
         assert_eq!(rule.contains_id.as_deref(), Some("toei:902"));
+    }
+
+    #[test]
+    fn parse_frequencies_reads_windows_and_24h_times() {
+        let t = Table::parse(
+            "trip_id,start_time,end_time,headway_secs,exact_times\nT1,08:00:00,09:30:00,300,0\nT1,25:00:00,25:30:00,600,1\n",
+        );
+        let fs = parse_frequencies(&t).expect("should parse");
+        assert_eq!(fs.len(), 2);
+        assert_eq!(fs[0].start_time, 8 * 3600);
+        assert_eq!(fs[0].end_time, 9 * 3600 + 1800);
+        assert_eq!(fs[0].headway_secs, 300);
+        assert_eq!(fs[0].exact_times, 0);
+        assert_eq!(fs[1].start_time, 25 * 3600, "24時超の頻度ウィンドウも読める");
+        assert_eq!(fs[1].exact_times, 1);
+    }
+
+    #[test]
+    fn namespace_prefixes_frequency_trip_id() {
+        let mut feed = Feed {
+            frequencies: vec![Frequency { trip_id: TripId::new("T1"), start_time: 0, end_time: 3600, headway_secs: 300, exact_times: 0 }],
+            ..Feed::default()
+        };
+        feed.namespace("jr");
+        assert_eq!(feed.frequencies[0].trip_id.as_str(), "jr:T1");
     }
 
     #[test]

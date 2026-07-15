@@ -187,15 +187,21 @@ fn shinjuku_to_hongo_sanchome_door_to_door_is_sane_for_solo_and_stroller() {
             best.total_duration_s
         );
         assert!(best.transfers <= 3, "{mobility:?}: transfers={} が多すぎる", best.transfers);
-        // 新宿⇄本郷三丁目は都営/メトロいずれも運賃データ (fare_attributes/fare_rules) を
-        // 持つフィードのみで到達できる (自前頻度JRを経由しない) ため、fare_yen は必ず
-        // 判明する。金額は経路選定 (どの駅で乗換えるか) に依存し得るため厳密な1点では
-        // 検証せず、実測レンジ (都営/メトロの初乗り〜複数区間分, 100円台〜1000円台) で見る
-        // (本家OTPとの数値突き合わせは `scripts/compare_otp.sh` の固定OD、および
-        // otp-fares クレートのユニットテストの役目)。
-        assert!(best.fare_yen.is_some(), "{mobility:?}: 都営/メトロのみで到達可能なはずなのに fare_yen が None だった: {best:?}");
-        let fare = best.fare_yen.unwrap();
-        assert!((100.0..2000.0).contains(&fare), "{mobility:?}: fare_yen={fare} は想定レンジ外");
+        // 運賃: 自前頻度GTFS (BMC-FREQ, JR/私鉄/京王/東武) は運賃データを持たないため、
+        // 最速経路が頻度路線 (例: 中央線快速→丸ノ内線) を含む場合は fare_yen=None が正しい
+        // (判明分だけの過小提示をしない方針。honestに「運賃不明」)。頻度legを含まない
+        // 都営/メトロ等のみの経路なら fare_yen は必ず判明し、実測レンジに収まるべき。
+        let uses_frequency = best
+            .legs
+            .iter()
+            .any(|l| matches!(l, Leg::Transit { agency_id, .. } if agency_id == "BMC-FREQ"));
+        if uses_frequency {
+            assert!(best.fare_yen.is_none(), "{mobility:?}: 頻度(BMC-FREQ)legを含むので運賃は不明(None)のはず: {best:?}");
+        } else {
+            assert!(best.fare_yen.is_some(), "{mobility:?}: 都営/メトロのみの経路なのに fare_yen が None: {best:?}");
+            let fare = best.fare_yen.unwrap();
+            assert!((100.0..2000.0).contains(&fare), "{mobility:?}: fare_yen={fare} は想定レンジ外");
+        }
     }
 }
 

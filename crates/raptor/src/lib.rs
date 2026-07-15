@@ -234,6 +234,16 @@ impl Timetable {
             }
         }
 
+        // 4.5. frequencies.txt 索引: trip_id → その頻度運行ウィンドウ群 (対象モードの便のみ)。
+        let mut freqs_by_trip: HashMap<TripId, Vec<&otp_gtfs::Frequency>> = HashMap::new();
+        for feed in feeds {
+            for f in &feed.frequencies {
+                if trip_route.contains_key(&f.trip_id) {
+                    freqs_by_trip.entry(f.trip_id.clone()).or_default().push(f);
+                }
+            }
+        }
+
         // 5. パターン化: (route_id, 正規化停留所列) が同じ trip をグルーピング。
         let mut pattern_index: HashMap<(RouteId, Vec<StopIdx>), PatternIdx> = HashMap::new();
         let mut patterns: Vec<Pattern> = Vec::new();
@@ -268,12 +278,39 @@ impl Timetable {
                 });
                 (patterns.len() - 1) as PatternIdx
             });
-            patterns[pattern_idx as usize].trips.push(PatternTrip {
-                trip_id: trip_id.clone(),
-                service_id: trip.service_id.clone(),
-                arrivals,
-                departures,
-            });
+            // frequencies.txt があれば雛形 trip を各ウィンドウ内で headway 間隔に展開する
+            // (頻度ベースダイヤ = 自前頻度 GTFS の JR/私鉄/京王/東武)。無ければ確定時刻の
+            // 便としてそのまま1本積む。展開時刻は「先頭発を基準にした相対 stop_times」を
+            // 各発車時刻ぶんシフトする。
+            match freqs_by_trip.get(&trip_id) {
+                Some(windows) => {
+                    let base_start = departures[0];
+                    for f in windows {
+                        if f.headway_secs == 0 {
+                            continue; // 0除算/無限ループ防止 (不正データは黙って飛ばす)
+                        }
+                        let mut dep = f.start_time;
+                        while dep < f.end_time {
+                            let offset = dep - base_start;
+                            patterns[pattern_idx as usize].trips.push(PatternTrip {
+                                trip_id: TripId::new(format!("{}@{dep}", trip_id.as_str())),
+                                service_id: trip.service_id.clone(),
+                                arrivals: arrivals.iter().map(|&a| a + offset).collect(),
+                                departures: departures.iter().map(|&d| d + offset).collect(),
+                            });
+                            dep += f.headway_secs as i32;
+                        }
+                    }
+                }
+                None => {
+                    patterns[pattern_idx as usize].trips.push(PatternTrip {
+                        trip_id: trip_id.clone(),
+                        service_id: trip.service_id.clone(),
+                        arrivals,
+                        departures,
+                    });
+                }
+            }
         }
 
         for pattern in &mut patterns {
@@ -774,6 +811,37 @@ mod tests {
         assert_eq!(weekday_index(20260714), 1);
         assert_eq!(weekday_index(20260719), 6); // 日曜日
         assert_eq!(weekday_index(20260720), 0); // 月曜日
+    }
+
+    #[test]
+    fn build_expands_frequency_trips_into_headway_spaced_departures() {
+        use otp_gtfs::{Calendar, Frequency, Route, RouteType, Stop, StopTime, Trip, WheelchairBoarding};
+        // 雛形 trip T1 (A発0秒→B着300秒) を frequencies で 08:00-09:00 の10分間隔運行にする。
+        // (32400-28800)/600 = 6本に展開され、各先頭発は 28800,29400,...,31800 になるはず。
+        let feed = Feed {
+            stops: vec![
+                Stop { id: StopId::new("A"), name: "A".into(), lat: 35.0, lng: 139.0, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+                Stop { id: StopId::new("B"), name: "B".into(), lat: 35.01, lng: 139.01, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+            ],
+            routes: vec![Route { id: RouteId::new("R1"), agency_id: None, short_name: "R1".into(), long_name: "R1".into(), route_type: RouteType::Rail }],
+            trips: vec![Trip { id: TripId::new("T1"), route_id: RouteId::new("R1"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown }],
+            stop_times: vec![
+                StopTime { trip_id: TripId::new("T1"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 0, departure: 0 },
+                StopTime { trip_id: TripId::new("T1"), stop_id: StopId::new("B"), stop_sequence: 2, arrival: 300, departure: 300 },
+            ],
+            calendars: vec![Calendar { service_id: otp_core::ServiceId::new("WD"), weekdays: [true, true, true, true, true, false, false], start_date: 20260101, end_date: 20301231 }],
+            frequencies: vec![Frequency { trip_id: TripId::new("T1"), start_time: 28800, end_time: 32400, headway_secs: 600, exact_times: 0 }],
+            ..Feed::default()
+        };
+        let tt = Timetable::build(&[feed]).expect("timetable should build");
+        assert_eq!(tt.patterns.len(), 1, "1パターン (A→B)");
+        let trips = &tt.patterns[0].trips;
+        assert_eq!(trips.len(), 6, "10分間隔で6本に展開されるはず");
+        let firsts: Vec<i32> = trips.iter().map(|t| t.departures[0]).collect();
+        assert_eq!(firsts, vec![28800, 29400, 30000, 30600, 31200, 31800]);
+        // 相対 stop_times のシフト: 各便の B 着は先頭発+300 のはず。
+        assert_eq!(trips[0].arrivals[1], 29100);
+        assert_eq!(trips[5].arrivals[1], 32100);
     }
 
     #[test]
