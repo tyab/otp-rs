@@ -76,7 +76,7 @@ fn plan_wires_access_walk_raptor_and_egress_walk_into_one_itinerary() {
     assert_eq!(best.legs.len(), 4, "legs was {:?}", best.legs);
 
     match &best.legs[0] {
-        Leg::Walk { distance_m, duration_s, has_stairs } => {
+        Leg::Walk { distance_m, duration_s, has_stairs, .. } => {
             // 34.9995,138.9995 -> 35.00,139.00 の実距離は約78m。
             assert!((50.0..120.0).contains(distance_m), "access distance_m={distance_m}");
             assert!(*duration_s > 0, "access duration should be non-zero");
@@ -89,18 +89,19 @@ fn plan_wires_access_walk_raptor_and_egress_walk_into_one_itinerary() {
         .legs
         .iter()
         .filter_map(|l| match l {
-            Leg::Transit { route_name, from_stop, to_stop, duration_s } => Some((route_name.clone(), from_stop.clone(), to_stop.clone(), *duration_s)),
+            Leg::Transit { route_short_name, from_name, to_name, duration_s, .. } => Some((route_short_name.clone(), from_name.clone(), to_name.clone(), *duration_s)),
             _ => None,
         })
         .collect();
     assert_eq!(transit_legs.len(), 2, "大江戸線...ではなく mini fixture のT1/T2を2本乗り継ぐはず: {transit_legs:?}");
-    assert_eq!(transit_legs[0].1, "A");
-    assert_eq!(transit_legs[0].2, "C");
-    assert_eq!(transit_legs[1].1, "C");
-    assert_eq!(transit_legs[1].2, "D");
+    // from_name/to_name は停留所名 (parent_station 集約後は親駅名を優先)。
+    assert_eq!(transit_legs[0].1, "A駅");
+    assert_eq!(transit_legs[0].2, "C駅");
+    assert_eq!(transit_legs[1].1, "C駅");
+    assert_eq!(transit_legs[1].2, "D駅");
 
     match best.legs.last().unwrap() {
-        Leg::Walk { distance_m, duration_s, has_stairs } => {
+        Leg::Walk { distance_m, duration_s, has_stairs, .. } => {
             assert!((50.0..120.0).contains(distance_m), "egress distance_m={distance_m}");
             assert!(*duration_s > 0, "egress duration should be non-zero");
             assert!(!has_stairs);

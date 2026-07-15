@@ -132,11 +132,11 @@ fn main() {
         println!("[{i}] total={h}h{m:02}m ({}s) transfers={} fare_yen={:?}", it.total_duration_s, it.transfers, it.fare_yen);
         for leg in &it.legs {
             match leg {
-                Leg::Walk { distance_m, duration_s, has_stairs } => {
-                    println!("  WALK distance={distance_m:.1}m duration={duration_s}s has_stairs={has_stairs}");
+                Leg::Walk { from_name, to_name, distance_m, duration_s, has_stairs, .. } => {
+                    println!("  WALK {from_name} -> {to_name} distance={distance_m:.1}m duration={duration_s}s has_stairs={has_stairs}");
                 }
-                Leg::Transit { route_name, from_stop, to_stop, duration_s } => {
-                    println!("  TRANSIT route={route_name} {from_stop} -> {to_stop} duration={duration_s}s");
+                Leg::Transit { route_short_name, from_name, to_name, duration_s, .. } => {
+                    println!("  TRANSIT route={route_short_name} {from_name} -> {to_name} duration={duration_s}s");
                 }
             }
         }

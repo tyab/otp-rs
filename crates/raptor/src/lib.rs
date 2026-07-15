@@ -63,6 +63,13 @@ pub struct PatternTrip {
 pub struct Pattern {
     pub route_id: RouteId,
     pub route_short_name: String,
+    /// GTFS `route_long_name`。babymobi 側の路線ID突合 (railwayIdFromOtpRouteName) は
+    /// long_name を鍵にするため、short とは別に保持する。空なら short_name を流用。
+    pub route_long_name: String,
+    /// 交通モード (mode 文字列 SUBWAY/RAIL/TRAM/BUS の生成に使う)。
+    pub route_type: otp_gtfs::RouteType,
+    /// GTFS `agency_id` (生値, 名前空間化しない)。頻度ベース自前GTFS(BMC-FREQ)判定に使う。
+    pub agency_id: String,
     pub stops: Vec<StopIdx>,
     pub trips: Vec<PatternTrip>,
 }
@@ -91,6 +98,9 @@ struct Transfer {
 pub struct Timetable {
     /// StopIdx → 正規化された StopId (`parent_station` があればそれ、無ければ自身)。
     pub stop_ids: Vec<StopId>,
+    /// StopIdx → 停留所名 (`Stop::name`)。babymobi の Route セグメント表示 (駅名) 用。
+    /// 同一正規化停留所に複数の生 stop が属す場合は最初に見つかった非空名を採用。
+    stop_names: Vec<String>,
     /// 生の stop_id (プラットフォーム含む) と正規化後 StopId の両方から引ける索引。
     stop_lookup: HashMap<StopId, StopIdx>,
     pub patterns: Vec<Pattern>,
@@ -157,6 +167,7 @@ impl Timetable {
         let mut canonical_of: HashMap<StopId, StopId> = HashMap::new();
         let mut coord_acc: HashMap<StopId, (f64, f64, u32)> = HashMap::new();
         let mut zone_of: HashMap<StopId, String> = HashMap::new();
+        let mut name_of: HashMap<StopId, String> = HashMap::new();
 
         for feed in feeds {
             for stop in &feed.stops {
@@ -175,9 +186,20 @@ impl Timetable {
                 acc.1 += stop.lng;
                 acc.2 += 1;
 
-                // 最初に見つかった非空の zone_id を採用 (struct doc 参照)。
+                // 最初に見つかった非空の zone_id / 名前を採用 (struct doc 参照)。
                 if let Some(z) = &stop.zone_id {
-                    zone_of.entry(canonical).or_insert_with(|| z.clone());
+                    zone_of.entry(canonical.clone()).or_insert_with(|| z.clone());
+                }
+                // 名前は「その正規化停留所自身 (親駅 or 単独駅)」の名前を優先し、
+                // 無ければプラットフォーム名で埋める (例: parent_station C の名前 "C駅" を
+                // プラットフォーム "C駅1番線" より優先。実データは parent_station が空なので
+                // 常に自身の名前)。
+                if !stop.name.is_empty() {
+                    if stop.id == canonical {
+                        name_of.insert(canonical.clone(), stop.name.clone());
+                    } else {
+                        name_of.entry(canonical.clone()).or_insert_with(|| stop.name.clone());
+                    }
                 }
             }
         }
@@ -238,6 +260,9 @@ impl Timetable {
                 patterns.push(Pattern {
                     route_id: trip.route_id.clone(),
                     route_short_name: if route.short_name.is_empty() { route.long_name.clone() } else { route.short_name.clone() },
+                    route_long_name: if route.long_name.is_empty() { route.short_name.clone() } else { route.long_name.clone() },
+                    route_type: route.route_type,
+                    agency_id: route.agency_id.as_ref().map(|a| a.as_str().to_string()).unwrap_or_default(),
                     stops,
                     trips: Vec::new(),
                 });
@@ -319,8 +344,17 @@ impl Timetable {
         }
 
         let stop_zones: Vec<Option<String>> = stop_ids.iter().map(|id| zone_of.get(id).cloned()).collect();
+        let stop_names: Vec<String> = stop_ids
+            .iter()
+            .map(|id| name_of.get(id).cloned().unwrap_or_else(|| id.as_str().to_string()))
+            .collect();
 
-        Ok(Timetable { stop_ids, stop_lookup, patterns, stop_patterns, transfers, calendars, stop_coords, stop_zones })
+        Ok(Timetable { stop_ids, stop_names, stop_lookup, patterns, stop_patterns, transfers, calendars, stop_coords, stop_zones })
+    }
+
+    /// StopIdx → 停留所名。名前が無ければ StopId を返す (フォールバック)。
+    pub fn stop_name(&self, stop: StopIdx) -> &str {
+        self.stop_names.get(stop as usize).map(String::as_str).unwrap_or("")
     }
 
     /// GTFS 生 stop_id (プラットフォーム含む) または正規化済み StopId から StopIdx を引く。
@@ -427,6 +461,9 @@ pub enum JourneyLeg {
     Transit {
         route_id: RouteId,
         route_short_name: String,
+        route_long_name: String,
+        route_type: otp_gtfs::RouteType,
+        agency_id: String,
         trip_id: TripId,
         from: StopIdx,
         to: StopIdx,
@@ -648,6 +685,9 @@ impl Timetable {
                     legs_rev.push(JourneyLeg::Transit {
                         route_id: pat.route_id.clone(),
                         route_short_name: pat.route_short_name.clone(),
+                        route_long_name: pat.route_long_name.clone(),
+                        route_type: pat.route_type,
+                        agency_id: pat.agency_id.clone(),
                         trip_id: trip.trip_id.clone(),
                         from: board_stop,
                         to: cur_stop,

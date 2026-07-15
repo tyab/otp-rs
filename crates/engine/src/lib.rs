@@ -42,19 +42,48 @@ pub struct RouteRequest {
 }
 
 /// 応答の1区間 (徒歩 or 乗車)。
+///
+/// babymobi の Route セグメント (駅名・座標・路線・地図折れ線) を組めるだけの情報を持つ。
+/// `from`/`to` は「発地→着地」の名前と座標。徒歩の access/egress は `geometry` に街路の
+/// 実経路 (折れ線) を持ち、乗換 (footpath) と乗車は 2点直線になる。
 #[derive(Debug, Clone)]
 pub enum Leg {
     Walk {
+        from_name: String,
+        from_coord: LatLng,
+        to_name: String,
+        to_coord: LatLng,
         distance_m: f32,
         duration_s: u32,
         has_stairs: bool,
+        /// 地図表示用の折れ線 (始点→終点)。access/egress は街路A*の実経路、
+        /// 近接駅の footpath 乗換は 2点直線。
+        geometry: Vec<LatLng>,
     },
     Transit {
-        route_name: String,
-        from_stop: String,
-        to_stop: String,
+        route_short_name: String,
+        route_long_name: String,
+        /// OTP 互換の mode 文字列 (SUBWAY/RAIL/TRAM/BUS)。
+        mode: &'static str,
+        /// GTFS agency_id (生値)。頻度ベース自前GTFS(BMC-FREQ)判定用。
+        agency_id: String,
+        from_name: String,
+        from_coord: LatLng,
+        to_name: String,
+        to_coord: LatLng,
         duration_s: u32,
     },
+}
+
+/// GTFS route_type → OTP 互換 mode 文字列。
+fn otp_mode(rt: otp_gtfs::RouteType) -> &'static str {
+    match rt {
+        otp_gtfs::RouteType::Tram => "TRAM",
+        otp_gtfs::RouteType::Subway => "SUBWAY",
+        otp_gtfs::RouteType::Rail => "RAIL",
+        otp_gtfs::RouteType::Bus => "BUS",
+        otp_gtfs::RouteType::Other(_) => "RAIL",
+    }
 }
 
 /// 応答の1経路。
@@ -202,31 +231,62 @@ impl Engine {
         egress_paths: &HashMap<otp_raptor::StopIdx, otp_street::WalkPath>,
     ) -> Itinerary {
         let last_idx = journey.legs.len().saturating_sub(1);
-        let legs: Vec<Leg> = journey
-            .legs
-            .iter()
-            .enumerate()
-            .map(|(i, leg)| match leg {
+        // 発地→着地を順に辿るカーソル (直前 leg の到達地点)。徒歩 leg の from/to 名前・
+        // 座標を、その両端 (出発地/目的地 or 駅) から解決するために使う。
+        let mut cursor_name = "出発地".to_string();
+        let mut cursor_coord = req.origin;
+
+        let mut legs: Vec<Leg> = Vec::with_capacity(journey.legs.len());
+        for (i, leg) in journey.legs.iter().enumerate() {
+            match leg {
                 otp_raptor::JourneyLeg::Walk { stop, duration_s } => {
-                    let (distance_m, has_stairs) = if i == 0 {
-                        access_paths.get(stop).map(|p| (p.distance_m, p.has_stairs)).unwrap_or((0.0, false))
+                    let stop_name = self.timetable.stop_name(*stop).to_string();
+                    let stop_coord = self.timetable.stop_coord(*stop);
+                    let (from_name, from_coord, to_name, to_coord, distance_m, has_stairs, geometry) = if i == 0 {
+                        // access: 出発地 → 乗車駅。街路A*の実経路をジオメトリに。
+                        let p = access_paths.get(stop);
+                        let geom = p.map(|p| self.street.path_coords(p)).unwrap_or_default();
+                        let (d, s) = p.map(|p| (p.distance_m, p.has_stairs)).unwrap_or((0.0, false));
+                        (cursor_name.clone(), cursor_coord, stop_name, stop_coord, d, s, geom)
                     } else if i == last_idx {
-                        egress_paths.get(stop).map(|p| (p.distance_m, p.has_stairs)).unwrap_or((0.0, false))
+                        // egress: 降車駅 → 目的地。
+                        let p = egress_paths.get(stop);
+                        let geom = p.map(|p| self.street.path_coords(p)).unwrap_or_default();
+                        let (d, s) = p.map(|p| (p.distance_m, p.has_stairs)).unwrap_or((0.0, false));
+                        (cursor_name.clone(), cursor_coord, "目的地".to_string(), req.destination, d, s, geom)
                     } else {
-                        // RAPTOR 内部の近接駅徒歩乗換 (footpath)。直線距離近似のため
-                        // 距離は保持していない (otp_raptor モジュール doc 参照)。
-                        (0.0, false)
+                        // RAPTOR 内部の近接駅徒歩乗換 (footpath)。直線距離近似のため距離は
+                        // 保持せず、ジオメトリは 2点直線 (otp_raptor モジュール doc 参照)。
+                        (cursor_name.clone(), cursor_coord, stop_name.clone(), stop_coord, 0.0, false, vec![cursor_coord, stop_coord])
                     };
-                    Leg::Walk { distance_m, duration_s: *duration_s, has_stairs }
+                    // access 以外はジオメトリが空になりうる (footpath は上で2点直線を入れた
+                    // ので空にならないが、街路経路が取れなかった端点用のフォールバック)。
+                    let geometry = if geometry.len() >= 2 { geometry } else { vec![from_coord, to_coord] };
+                    cursor_name = to_name.clone();
+                    cursor_coord = to_coord;
+                    legs.push(Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s: *duration_s, has_stairs, geometry });
                 }
-                otp_raptor::JourneyLeg::Transit { route_short_name, from, to, board_s, alight_s, .. } => Leg::Transit {
-                    route_name: route_short_name.clone(),
-                    from_stop: self.timetable.stop_ids[*from as usize].as_str().to_string(),
-                    to_stop: self.timetable.stop_ids[*to as usize].as_str().to_string(),
-                    duration_s: (alight_s - board_s).max(0) as u32,
-                },
-            })
-            .collect();
+                otp_raptor::JourneyLeg::Transit { route_short_name, route_long_name, route_type, agency_id, from, to, board_s, alight_s, .. } => {
+                    let from_name = self.timetable.stop_name(*from).to_string();
+                    let from_coord = self.timetable.stop_coord(*from);
+                    let to_name = self.timetable.stop_name(*to).to_string();
+                    let to_coord = self.timetable.stop_coord(*to);
+                    cursor_name = to_name.clone();
+                    cursor_coord = to_coord;
+                    legs.push(Leg::Transit {
+                        route_short_name: route_short_name.clone(),
+                        route_long_name: route_long_name.clone(),
+                        mode: otp_mode(*route_type),
+                        agency_id: agency_id.clone(),
+                        from_name,
+                        from_coord,
+                        to_name,
+                        to_coord,
+                        duration_s: (alight_s - board_s).max(0) as u32,
+                    });
+                }
+            }
+        }
 
         Itinerary {
             legs,

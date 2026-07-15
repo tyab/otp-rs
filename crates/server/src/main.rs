@@ -218,6 +218,19 @@ fn handle_request(mut request: tiny_http::Request, engine: &Engine) {
                 Err(e) => (400u16, otp_server::handler::error_json(&format!("failed to read request body: {e}"))),
             }
         }
+        // OTP2 GraphQL 互換 (babymobi の apps/api/src/otp/client.ts が叩く planConnection)。
+        // JVM OTP をこのサーバに差し替えても babymobi 側を無改修にするためのドロップイン。
+        (tiny_http::Method::Post, "/otp/gtfs/v1") => {
+            let mut buf = Vec::new();
+            match request.as_reader().read_to_end(&mut buf) {
+                Ok(_) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| otp_server::handler::handle_gtfs_graphql(engine, &buf))) {
+                    Ok(Ok(json)) => (200u16, json),
+                    Ok(Err(err)) => (err.status, err.to_json()),
+                    Err(_) => (500u16, otp_server::handler::error_json("internal error (panic) while handling /otp/gtfs/v1")),
+                },
+                Err(e) => (400u16, otp_server::handler::error_json(&format!("failed to read request body: {e}"))),
+            }
+        }
         _ => (404u16, otp_server::handler::error_json("not found")),
     };
 

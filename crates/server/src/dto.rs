@@ -87,27 +87,51 @@ pub struct ItineraryDto {
     pub legs: Vec<LegDto>,
 }
 
+/// 座標の出力用 DTO。
+#[derive(Debug, Serialize)]
+pub struct CoordDto {
+    pub lat: f64,
+    pub lng: f64,
+}
+
+impl From<LatLng> for CoordDto {
+    fn from(c: LatLng) -> Self {
+        CoordDto { lat: c.lat, lng: c.lng }
+    }
+}
+
 /// `mode` タグで WALK/TRANSIT を判別する (フロント側が `switch(leg.mode)` できる形)。
 #[derive(Debug, Serialize)]
 #[serde(tag = "mode")]
 pub enum LegDto {
     #[serde(rename = "WALK")]
     Walk {
+        #[serde(rename = "fromName")]
+        from_name: String,
+        #[serde(rename = "toName")]
+        to_name: String,
         #[serde(rename = "distanceM")]
         distance_m: f32,
         #[serde(rename = "durationS")]
         duration_s: u32,
         #[serde(rename = "hasStairs")]
         has_stairs: bool,
+        /// 折れ線 (始点→終点)。
+        geometry: Vec<CoordDto>,
     },
     #[serde(rename = "TRANSIT")]
     Transit {
         #[serde(rename = "routeName")]
         route_name: String,
-        #[serde(rename = "fromStop")]
-        from_stop: String,
-        #[serde(rename = "toStop")]
-        to_stop: String,
+        #[serde(rename = "routeLongName")]
+        route_long_name: String,
+        /// SUBWAY/RAIL/TRAM/BUS。
+        #[serde(rename = "transitMode")]
+        transit_mode: String,
+        #[serde(rename = "fromName")]
+        from_name: String,
+        #[serde(rename = "toName")]
+        to_name: String,
         #[serde(rename = "durationS")]
         duration_s: u32,
     },
@@ -133,12 +157,22 @@ impl ItineraryDto {
 impl LegDto {
     fn from_leg(leg: &Leg) -> Self {
         match leg {
-            Leg::Walk { distance_m, duration_s, has_stairs } => {
-                LegDto::Walk { distance_m: *distance_m, duration_s: *duration_s, has_stairs: *has_stairs }
-            }
-            Leg::Transit { route_name, from_stop, to_stop, duration_s } => {
-                LegDto::Transit { route_name: route_name.clone(), from_stop: from_stop.clone(), to_stop: to_stop.clone(), duration_s: *duration_s }
-            }
+            Leg::Walk { from_name, to_name, distance_m, duration_s, has_stairs, geometry, .. } => LegDto::Walk {
+                from_name: from_name.clone(),
+                to_name: to_name.clone(),
+                distance_m: *distance_m,
+                duration_s: *duration_s,
+                has_stairs: *has_stairs,
+                geometry: geometry.iter().map(|c| (*c).into()).collect(),
+            },
+            Leg::Transit { route_short_name, route_long_name, mode, from_name, to_name, duration_s, .. } => LegDto::Transit {
+                route_name: route_short_name.clone(),
+                route_long_name: route_long_name.clone(),
+                transit_mode: mode.to_string(),
+                from_name: from_name.clone(),
+                to_name: to_name.clone(),
+                duration_s: *duration_s,
+            },
         }
     }
 }
@@ -195,8 +229,27 @@ mod tests {
     fn itinerary_serializes_with_tagged_leg_modes() {
         let itineraries = vec![Itinerary {
             legs: vec![
-                Leg::Walk { distance_m: 120.5, duration_s: 90, has_stairs: false },
-                Leg::Transit { route_name: "都営新宿線".to_string(), from_stop: "新宿".to_string(), to_stop: "本郷三丁目".to_string(), duration_s: 1200 },
+                Leg::Walk {
+                    from_name: "出発地".to_string(),
+                    from_coord: LatLng::new(35.69, 139.70),
+                    to_name: "新宿".to_string(),
+                    to_coord: LatLng::new(35.691, 139.70),
+                    distance_m: 120.5,
+                    duration_s: 90,
+                    has_stairs: false,
+                    geometry: vec![LatLng::new(35.69, 139.70), LatLng::new(35.691, 139.70)],
+                },
+                Leg::Transit {
+                    route_short_name: "新宿線".to_string(),
+                    route_long_name: "都営新宿線".to_string(),
+                    mode: "SUBWAY",
+                    agency_id: "toei".to_string(),
+                    from_name: "新宿".to_string(),
+                    from_coord: LatLng::new(35.691, 139.70),
+                    to_name: "本郷三丁目".to_string(),
+                    to_coord: LatLng::new(35.707, 139.759),
+                    duration_s: 1200,
+                },
             ],
             total_duration_s: 1400,
             transfers: 0,
@@ -208,7 +261,8 @@ mod tests {
         assert!(json.contains("\"mode\":\"TRANSIT\""), "json was: {json}");
         assert!(json.contains("\"totalDurationS\":1400"));
         assert!(json.contains("\"fareYen\":220.0"));
-        assert!(json.contains("\"routeName\":\"都営新宿線\""));
+        assert!(json.contains("\"routeName\":\"新宿線\""));
+        assert!(json.contains("\"routeLongName\":\"都営新宿線\""));
     }
 
     #[test]

@@ -360,6 +360,12 @@ impl StreetGraph {
     }
 
     /// A* の `came_from` チェーンを辿って [`WalkPath`] を組み立てる。
+    /// `WalkPath` のノード列を座標列に変換する (地図表示用の折れ線ジオメトリ)。
+    /// 始点→終点の順。ノードが1点以下なら空/単点になる。
+    pub fn path_coords(&self, path: &WalkPath) -> Vec<LatLng> {
+        path.nodes.iter().map(|&n| self.nodes[n as usize].coord).collect()
+    }
+
     fn reconstruct_path(
         &self,
         goal: NodeId,
