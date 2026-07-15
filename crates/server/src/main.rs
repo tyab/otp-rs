@@ -25,7 +25,7 @@ use std::time::Instant;
 use otp_engine::Engine;
 use otp_fares::FareModel;
 use otp_gtfs::Feed;
-use otp_raptor::Timetable;
+use otp_raptor::{ModeFilter, Timetable};
 use otp_street::StreetGraph;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -76,6 +76,8 @@ fn print_help() {
          \x20                       --gtfs 3=/data/tokyometro,6=/data/toei\n\
          \x20   --osm <path>     OSM XML (scripts/extract_osm_xml.sh の出力)\n\
          \x20   --port <port>    待受ポート (既定 {DEFAULT_PORT})\n\
+         \x20   --bus            バス路線も時刻表に含める (既定は鉄道のみ)。停留所・便数が\n\
+         \x20                    大きく増えるため起動時間とメモリが増える点に注意\n\
          \x20   --version, -V    バージョン表示\n\
          \x20   --help, -h       このヘルプ\n\n\
          ENDPOINTS:\n\
@@ -90,6 +92,8 @@ struct Config {
     gtfs_specs: Vec<(String, PathBuf)>,
     osm_path: PathBuf,
     port: u16,
+    /// 時刻表に含める交通モード (`--bus` でバスも含める。既定は鉄道のみ)。
+    modes: ModeFilter,
 }
 
 impl Config {
@@ -97,6 +101,7 @@ impl Config {
         let mut gtfs_arg: Option<String> = None;
         let mut osm_arg: Option<String> = None;
         let mut port = DEFAULT_PORT;
+        let mut modes = ModeFilter::RailOnly;
 
         let mut i = 0;
         while i < args.len() {
@@ -114,6 +119,9 @@ impl Config {
                     let v = args.get(i).ok_or("--port には値が必要です")?;
                     port = v.parse::<u16>().map_err(|_| format!("--port の値が不正です: {v:?}"))?;
                 }
+                "--bus" => {
+                    modes = ModeFilter::RailAndBus;
+                }
                 other => return Err(format!("不明な引数: {other:?}")),
             }
             i += 1;
@@ -121,7 +129,7 @@ impl Config {
 
         let gtfs_arg = gtfs_arg.ok_or("--gtfs は必須です")?;
         let osm_arg = osm_arg.ok_or("--osm は必須です")?;
-        Ok(Config { gtfs_specs: parse_gtfs_specs(&gtfs_arg), osm_path: PathBuf::from(osm_arg), port })
+        Ok(Config { gtfs_specs: parse_gtfs_specs(&gtfs_arg), osm_path: PathBuf::from(osm_arg), port, modes })
     }
 }
 
@@ -155,7 +163,7 @@ fn load_engine(config: &Config) -> otp_core::Result<Engine> {
         fares.insert(prefix.clone(), FareModel::from_gtfs(&feed));
         feeds.push(feed);
     }
-    let timetable = Timetable::build(&feeds)?;
+    let timetable = Timetable::build_with_modes(&feeds, config.modes)?;
     let timetable_elapsed = t_timetable.elapsed();
 
     let total_elapsed = overall_start.elapsed();

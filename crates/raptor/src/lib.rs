@@ -111,14 +111,42 @@ pub struct Timetable {
     stop_zones: Vec<Option<String>>,
 }
 
+/// 時刻表に含める交通モードの絞り込み。
+///
+/// バスは停留所数・便数が鉄道より桁違いに多く (都営バスだけで停留所5000超・
+/// stop_times 130万行)、鉄道のみの用途ではメモリ・起動時間の無駄になるため
+/// 既定は [`ModeFilter::RailOnly`]。ベビーカー主軸の BabyMobi ではノンステップ
+/// バスが深い地下ホームの代替になりうるため [`ModeFilter::RailAndBus`] を選べる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeFilter {
+    /// Tram/Subway/Rail のみ (`RouteType::is_rail`)。
+    RailOnly,
+    /// 鉄道 + Bus。
+    RailAndBus,
+}
+
+impl ModeFilter {
+    fn accepts(self, rt: otp_gtfs::RouteType) -> bool {
+        match self {
+            ModeFilter::RailOnly => rt.is_rail(),
+            ModeFilter::RailAndBus => rt.is_rail() || rt == otp_gtfs::RouteType::Bus,
+        }
+    }
+}
+
 impl Timetable {
-    /// `otp-gtfs::Feed` 群から鉄道のみの時刻表を構築する。
+    /// `otp-gtfs::Feed` 群から鉄道のみの時刻表を構築する ([`ModeFilter::RailOnly`])。
     ///
     /// 複数フィードをまたぐ場合は、呼び出し側が事前に
     /// `Feed::load_from_dir_namespaced` 等で stop_id/route_id/trip_id/service_id を
     /// フィード単位で一意にしておくこと (このメソッド自体はマージするだけで、
     /// ID の一意性検証は行わない)。
     pub fn build(feeds: &[Feed]) -> Result<Timetable> {
+        Self::build_with_modes(feeds, ModeFilter::RailOnly)
+    }
+
+    /// [`Timetable::build`] と同じだが、含める交通モードを [`ModeFilter`] で指定する。
+    pub fn build_with_modes(feeds: &[Feed], modes: ModeFilter) -> Result<Timetable> {
         // 1. 停留所の正規化 (parent_station への集約) と StopIdx 割り当て。
         //    正規化後の StopId ごとに座標 (緯度経度の平均) も集計する
         //    (近接駅の徒歩乗換判定に使う。実データはどのフィードも parent_station が
@@ -154,12 +182,12 @@ impl Timetable {
             }
         }
 
-        // 2. 鉄道路線のみ抽出 (route_id → route の索引をフィードごとに作る)。
-        let mut rail_routes: HashMap<RouteId, &otp_gtfs::Route> = HashMap::new();
+        // 2. 対象モードの路線のみ抽出 (route_id → route の索引をフィードごとに作る)。
+        let mut included_routes: HashMap<RouteId, &otp_gtfs::Route> = HashMap::new();
         for feed in feeds {
             for route in &feed.routes {
-                if route.route_type.is_rail() {
-                    rail_routes.insert(route.id.clone(), route);
+                if modes.accepts(route.route_type) {
+                    included_routes.insert(route.id.clone(), route);
                 }
             }
         }
@@ -168,7 +196,7 @@ impl Timetable {
         let mut trip_route: HashMap<TripId, &otp_gtfs::Trip> = HashMap::new();
         for feed in feeds {
             for trip in &feed.trips {
-                if rail_routes.contains_key(&trip.route_id) {
+                if included_routes.contains_key(&trip.route_id) {
                     trip_route.insert(trip.id.clone(), trip);
                 }
             }
@@ -206,7 +234,7 @@ impl Timetable {
 
             let key = (trip.route_id.clone(), stops.clone());
             let pattern_idx = *pattern_index.entry(key).or_insert_with(|| {
-                let route = rail_routes[&trip.route_id];
+                let route = included_routes[&trip.route_id];
                 patterns.push(Pattern {
                     route_id: trip.route_id.clone(),
                     route_short_name: if route.short_name.is_empty() { route.long_name.clone() } else { route.short_name.clone() },

@@ -115,34 +115,80 @@ impl FareModel {
 
     /// 経路全体 (複数区間) の合計運賃を計算する。
     ///
-    /// ## 設計: 「フィードごとに1回の通し運賃」
+    /// ## 設計: `transfers` 制限を尊重した貪欲サブグループ化
     /// この `FareModel` が扱う `legs` は、呼び出し側 (otp-engine) が**同一フィード
     /// (同一事業者) の連続する乗車区間だけ**を渡す前提とする (otp-engine モジュールdoc
-    /// 参照)。日本の鉄道運賃は「乗車駅→降車駅」の1枚の切符で事業者内の乗換を含む距離制
-    /// 運賃であり (本家 OTP の実測でも、同一事業者内の乗換を挟む2 leg に対して
-    /// **同一の1個の運賃product** が紐付く。モジュールdoc の「都営単一事業者・乗換1回」
-    /// 参照)、区間ごとに `fare_for_leg` を呼んで単純合算すると多重課金になる。
-    /// そのため、`legs` 全体を「先頭の乗車ゾーン→末尾の降車ゾーン」の1区間に潰して
-    /// 1回だけ `fare_for_leg` を呼ぶ。事業者を跨ぐ場合の合算は otp-engine 側の責務
-    /// (フィードごとに `total_fare` を呼んで結果を合算する)。
+    /// 参照)。GTFS-Fares v1 の `fare_attributes.transfers` は「その運賃1枚で許される
+    /// 乗換回数」を表す (空欄=無制限, 0=乗継不可, 1=1回, ...)。事業者ごとに運賃体系が
+    /// 異なるため、単純な「全 leg を1枚に畳む」でも「leg ごとに1枚」でも正しくならない:
     ///
-    /// `origin_zone`/`destination_zone` のいずれかが無い (`zone_id` を持たないフィード、
-    /// または otp-engine 側でゾーンを解決できなかった区間) 場合は運賃算出不可として
-    /// 明示的に `Err` を返す (ワイルドカード一致で誤った運賃を返すことを避ける)。
+    /// - **距離制の鉄道** (都営/メトロ/りんかい/京王/東武: `transfers` 空欄=無制限):
+    ///   「乗車駅→降車駅」の1枚で事業者内の乗換を含む。区間ごとに `fare_for_leg` を
+    ///   呼んで合算すると多重課金になる (本家 OTP 実測でも同一事業者内乗換の2 leg に
+    ///   同一運賃product が1個。モジュールdoc「都営単一事業者・乗換1回」参照)。
+    /// - **均一運賃のバス** (都営バス: `transfers=0`, かつ運賃は `route_id` 基準で
+    ///   `zone_id` 無し): 1乗車ごとに別運賃。畳むと過小請求になる。
+    ///
+    /// そこで先頭 leg から**カバーできる最大スパンを貪欲に取る**: `[i..=j]` を1区間に
+    /// 潰した運賃が一致し、かつその運賃の `transfers` が区間内乗換回数 `j-i` 以上なら
+    /// その運賃1枚で `[i..=j]` を賄い、`i=j+1` へ進む。鉄道は末尾降車まで含めた最大
+    /// スパン (通し運賃) が、バスは transfers=0 のため各 leg 単独が選ばれる。事業者を
+    /// 跨ぐ合算は otp-engine 側の責務 (フィードごとに `total_fare` を呼んで合算)。
+    ///
+    /// どの部分区間にも一致する運賃が無い場合は運賃算出不可として `Err` を返す
+    /// (判明分だけの過小提示や、ワイルドカード誤一致を避ける)。
     pub fn total_fare(&self, legs: &[FareLeg]) -> Result<Money> {
         if legs.is_empty() {
             return Ok(Money { amount: 0.0 });
         }
-        let origin = legs[0].origin_zone.clone();
-        let destination = legs[legs.len() - 1].destination_zone.clone();
-        let (Some(origin), Some(destination)) = (origin, destination) else {
-            return Err(Error::NotFound(
-                "fare zone (zone_id) missing for leg; cannot compute through-fare".to_string(),
-            ));
-        };
+        let mut total = 0.0;
+        let mut i = 0;
+        while i < legs.len() {
+            // `[i..=j]` を1枚でカバーできる最大の j を探す。ゾーン制の通し運賃は
+            // 末尾降車まで含めて初めて一致するため、大きい span から順に試す。
+            let mut chosen: Option<(usize, f64)> = None;
+            let mut j = legs.len() - 1;
+            loop {
+                if let Some(attr) = self.through_fare(&legs[i..=j]) {
+                    let transfers_used = (j - i) as u32;
+                    let permitted = attr.transfers.is_none_or(|t| transfers_used <= t as u32);
+                    if permitted {
+                        chosen = Some((j, attr.price));
+                        break;
+                    }
+                }
+                if j == i {
+                    break;
+                }
+                j -= 1;
+            }
+            let (end, price) = chosen.ok_or_else(|| {
+                Error::NotFound(format!(
+                    "no matching GTFS-Fares v1 fare for leg #{i} (route={:?} origin={:?} destination={:?})",
+                    legs[i].route_id, legs[i].origin_zone, legs[i].destination_zone
+                ))
+            })?;
+            total += price;
+            i = end + 1;
+        }
+        Ok(Money { amount: total })
+    }
 
-        // contains_id ベースの一致 (未検証, fare_for_leg のdoc参照) 用に、区間が
-        // 通過する全ゾーン (各legのorigin/destination + 明示的なcontains_zones) を集める。
+    /// 連続する `legs` を「先頭乗車→末尾降車」の1区間 `FareLeg` に潰して一致する運賃を引く。
+    ///
+    /// `route_id` は全 leg で同一のときだけ保持する: 均一運賃バスのように運賃が
+    /// `route_id` 基準のフィードでは単独 leg の引きにこれが要る。複数路線をまたぐ区間は
+    /// `route_id=None` (ゾーン制の通し運賃は route 非依存)。`origin`/`destination` ゾーンが
+    /// 無い区間 (バス等ゾーン無しフィード) でも `route_id` 一致で引けるよう、ここでは
+    /// ゾーン欠落を即エラーにしない (最終的な一致判定は `rule_group_matches` に委ねる。
+    /// 鉄道のようにゾーン制のフィードでゾーンが欠ければ OD 行に一致せず `None` になる)。
+    fn through_fare(&self, legs: &[FareLeg]) -> Option<&FareAttribute> {
+        let first = legs.first()?;
+        let last = legs.last()?;
+        let uniform_route = legs.iter().all(|l| l.route_id == first.route_id);
+        let route_id = if uniform_route { first.route_id.clone() } else { None };
+        // contains_id ベースの一致 (未検証, fare_for_leg のdoc参照) 用に、区間が通過する
+        // 全ゾーンを集める。
         let contains_zones: Vec<String> = legs
             .iter()
             .flat_map(|l| {
@@ -152,21 +198,13 @@ impl FareModel {
                 zs
             })
             .collect();
-
         let combined = FareLeg {
-            // 通し運賃は route_id 非依存 (複数路線をまたぎうる) なのでワイルドカード。
-            route_id: None,
-            origin_zone: Some(origin),
-            destination_zone: Some(destination),
+            route_id,
+            origin_zone: first.origin_zone.clone(),
+            destination_zone: last.destination_zone.clone(),
             contains_zones,
         };
-
-        self.fare_for_leg(&combined).map(|attr| Money { amount: attr.price }).ok_or_else(|| {
-            Error::NotFound(format!(
-                "no matching GTFS-Fares v1 rule for origin={:?} destination={:?}",
-                combined.origin_zone, combined.destination_zone
-            ))
-        })
+        self.fare_for_leg(&combined)
     }
 }
 
@@ -322,5 +360,54 @@ mod tests {
         let model = zone_fare_model();
         let fare = model.total_fare(&[]).expect("empty legs should not error");
         assert_eq!(fare.amount, 0.0);
+    }
+
+    /// 均一運賃バスを模したフィクスチャ (都営バス実データ相当): route_id 基準・ゾーン無し・
+    /// `transfers=0` (1乗車ごとに別運賃)。
+    fn flat_bus_model() -> FareModel {
+        let flat = FareAttribute {
+            fare_id: FareId::new("F210"),
+            price: 210.0,
+            currency_type: "JPY".to_string(),
+            transfers: Some(0),
+            transfer_duration: None,
+        };
+        FareModel { attributes: vec![flat], rules: vec![route_rule("F210", "B1"), route_rule("F210", "B2")] }
+    }
+
+    #[test]
+    fn total_fare_charges_flat_bus_per_boarding_not_collapsed() {
+        // transfers=0 の均一運賃バスは、同一停留所で別路線に乗り継いでも (Walk leg を
+        // 挟まず連続 Transit になっても) 1乗車ごとに課金する。畳んで210円1回にすると
+        // 過小請求になる。B1→B2 の2乗車 = 210+210 = 420円。
+        let model = flat_bus_model();
+        let legs = vec![
+            FareLeg { route_id: Some(RouteId::new("B1")), origin_zone: None, destination_zone: None, contains_zones: vec![] },
+            FareLeg { route_id: Some(RouteId::new("B2")), origin_zone: None, destination_zone: None, contains_zones: vec![] },
+        ];
+        let fare = model.total_fare(&legs).expect("均一バスは route_id 基準で引ける");
+        assert_eq!(fare.amount, 420.0, "1乗車1運賃。畳んで210にしてはいけない");
+    }
+
+    #[test]
+    fn total_fare_single_bus_boarding_is_flat_fare() {
+        let model = flat_bus_model();
+        let legs = vec![FareLeg { route_id: Some(RouteId::new("B1")), origin_zone: None, destination_zone: None, contains_zones: vec![] }];
+        assert_eq!(model.total_fare(&legs).expect("引けるはず").amount, 210.0);
+    }
+
+    #[test]
+    fn total_fare_transfers_zero_blocks_same_route_reboard_collapse() {
+        // transfers=0 のゲートが効くのは「同一 route を連続で2回乗る」ケース
+        // (through_fare が route_id を保持でき、運賃が一致してしまう場面)。
+        // transfers=0 なので used=1>0 で結合が拒否され、210+210=420 になる。
+        // (もし transfers が空欄=無制限なら1枚に畳まれ 210 になってしまう。ここが
+        //  距離制鉄道と均一バスの分岐点)。
+        let model = flat_bus_model();
+        let legs = vec![
+            FareLeg { route_id: Some(RouteId::new("B1")), origin_zone: None, destination_zone: None, contains_zones: vec![] },
+            FareLeg { route_id: Some(RouteId::new("B1")), origin_zone: None, destination_zone: None, contains_zones: vec![] },
+        ];
+        assert_eq!(model.total_fare(&legs).unwrap().amount, 420.0, "同一routeでも transfers=0 なら畳まない");
     }
 }
