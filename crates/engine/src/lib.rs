@@ -75,19 +75,23 @@ pub enum Leg {
     },
 }
 
-/// 連続する `JourneyLeg::Transit` のうち「同一 route_id かつ 直前の to == 次の from
-/// (同一停留所で乗り継ぎ・Walk を挟まない)」ものを1本の Transit にまとめる。
-/// RAPTOR がループ線の分岐等で同一路線を別パターンに分割して返す「見かけの乗換」を、
-/// 本家 OTP と同様に同一路線の継続として1本化する (from/board は先頭、to/alight は末尾)。
-/// 異なる route_id 同士や、Walk を挟む乗換はまとめない (=正当な乗換として残す)。
+/// 連続する `JourneyLeg::Transit` のうち「同一 route_id・同一停留所 (直前の to == 次の from)
+/// かつ時間的に連続 (直前の降車時刻 == 次の乗車時刻 = 待ち0 = 同一車両の継続)」ものを
+/// 1本の Transit にまとめる。RAPTOR がループ線の分岐等で同一路線を別パターンに分割して
+/// 返す「見かけの乗換」を、本家 OTP と同様に同一路線の継続として1本化する
+/// (from/board は先頭、to/alight は末尾)。
+///
+/// 待ち時間がある場合 (降車時刻 < 次の乗車時刻) は別便への実際の乗り継ぎ (再乗車) なので
+/// **まとめない** — 実在する乗換/待ちを隠さないため (Codexレビュー指摘 P2)。異なる route_id
+/// 同士や Walk を挟む乗換も当然まとめない (=正当な乗換として残す)。
 fn merge_same_route_transit(legs: &[otp_raptor::JourneyLeg]) -> Vec<otp_raptor::JourneyLeg> {
     use otp_raptor::JourneyLeg;
     let mut out: Vec<JourneyLeg> = Vec::with_capacity(legs.len());
     for leg in legs {
-        if let JourneyLeg::Transit { route_id, from, to, alight_s, .. } = leg {
+        if let JourneyLeg::Transit { route_id, from, to, board_s, alight_s, .. } = leg {
             if let Some(JourneyLeg::Transit { route_id: p_route, to: p_to, alight_s: p_alight, .. }) = out.last_mut() {
-                if *p_route == *route_id && *p_to == *from {
-                    // 直前 leg の終端を今の leg の終端まで伸ばす (途中の中間駅は捨てる)。
+                if *p_route == *route_id && *p_to == *from && *p_alight == *board_s {
+                    // 待ち0の連続 → 直前 leg の終端を今の leg の終端まで伸ばす (中間駅は捨てる)。
                     *p_to = *to;
                     *p_alight = *alight_s;
                     continue;
@@ -443,5 +447,9 @@ mod tests {
         ];
         let transit_n = merge_same_route_transit(&walked).iter().filter(|l| matches!(l, JourneyLeg::Transit { .. })).count();
         assert_eq!(transit_n, 2, "Walkを挟む場合は統合しない");
+        // (D) 同一路線・同一停留所でも待ち時間がある (降車28860 < 次の乗車29000) なら別便への
+        //     再乗車 = 実際の乗換なので統合しない (実乗換を隠さない)。
+        let reboard = vec![transit("Oedo", 1, 5, 28800, 28860), transit("Oedo", 5, 9, 29000, 29760)];
+        assert_eq!(merge_same_route_transit(&reboard).len(), 2, "待ちがある再乗車は統合しない");
     }
 }

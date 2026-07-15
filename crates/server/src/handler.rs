@@ -84,6 +84,10 @@ pub fn handle_gtfs_graphql(engine: &Engine, body: &[u8]) -> Result<String, ApiEr
         return Ok(r#"{"data":{"__typename":"QueryType"}}"#.to_string());
     }
 
+    // 前提: babymobi の client.ts が投げる固定クエリの変数形状 (トップレベルに
+    // origin/destination/dateTime/wheelchair をそのまま渡す) を読む。汎用 GraphQL
+    // パーサではないので、変数名や dateTime のネスト形が変わるとここを追随させること
+    // (Codexレビュー指摘 P1: 別形状のクエリでは now_jst/Solo にフォールバックする)。
     let vars = v.get("variables").cloned().unwrap_or(Value::Null);
     let origin = parse_coord(&vars, "origin").ok_or_else(|| ApiError::bad_request("origin coordinate missing"))?;
     let destination = parse_coord(&vars, "destination").ok_or_else(|| ApiError::bad_request("destination coordinate missing"))?;
@@ -114,8 +118,10 @@ fn parse_coord(vars: &Value, key: &str) -> Option<LatLng> {
 /// (service_date=YYYYMMDD, depart_at=0時からの秒) に。null は現在時刻(JST)。
 /// arriveBy(latestArrival) は本エンジンが出発時刻探索のみのため出発時刻として近似する。
 fn parse_datetime(dt: Option<&Value>) -> (u32, i32) {
+    // earliestDeparture が明示的に null で latestArrival が入る形 (arriveBy) でも拾えるよう、
+    // 各キーに as_str を適用してから or_else でフォールバックする (Codexレビュー指摘 P2)。
     let iso = dt.and_then(|d| {
-        d.get("earliestDeparture").or_else(|| d.get("latestArrival")).and_then(Value::as_str)
+        d.get("earliestDeparture").and_then(Value::as_str).or_else(|| d.get("latestArrival").and_then(Value::as_str))
     });
     match iso.and_then(parse_iso_datetime) {
         Some(v) => v,
