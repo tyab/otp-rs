@@ -75,6 +75,30 @@ pub enum Leg {
     },
 }
 
+/// 連続する `JourneyLeg::Transit` のうち「同一 route_id かつ 直前の to == 次の from
+/// (同一停留所で乗り継ぎ・Walk を挟まない)」ものを1本の Transit にまとめる。
+/// RAPTOR がループ線の分岐等で同一路線を別パターンに分割して返す「見かけの乗換」を、
+/// 本家 OTP と同様に同一路線の継続として1本化する (from/board は先頭、to/alight は末尾)。
+/// 異なる route_id 同士や、Walk を挟む乗換はまとめない (=正当な乗換として残す)。
+fn merge_same_route_transit(legs: &[otp_raptor::JourneyLeg]) -> Vec<otp_raptor::JourneyLeg> {
+    use otp_raptor::JourneyLeg;
+    let mut out: Vec<JourneyLeg> = Vec::with_capacity(legs.len());
+    for leg in legs {
+        if let JourneyLeg::Transit { route_id, from, to, alight_s, .. } = leg {
+            if let Some(JourneyLeg::Transit { route_id: p_route, to: p_to, alight_s: p_alight, .. }) = out.last_mut() {
+                if *p_route == *route_id && *p_to == *from {
+                    // 直前 leg の終端を今の leg の終端まで伸ばす (途中の中間駅は捨てる)。
+                    *p_to = *to;
+                    *p_alight = *alight_s;
+                    continue;
+                }
+            }
+        }
+        out.push(leg.clone());
+    }
+    out
+}
+
 /// GTFS route_type → OTP 互換 mode 文字列。
 fn otp_mode(rt: otp_gtfs::RouteType) -> &'static str {
     match rt {
@@ -230,14 +254,19 @@ impl Engine {
         access_paths: &HashMap<otp_raptor::StopIdx, otp_street::WalkPath>,
         egress_paths: &HashMap<otp_raptor::StopIdx, otp_street::WalkPath>,
     ) -> Itinerary {
-        let last_idx = journey.legs.len().saturating_sub(1);
+        // 同一路線・同一停留所での連続 Transit を1本にまとめてから変換する。RAPTOR は
+        // ループ線の分岐 (例: 都営大江戸線 都庁前) で同一路線を別パターンとして分割し、
+        // Walk を挟まない連続 Transit leg = 「見かけの乗換」を返すことがある。本家 OTP は
+        // 同一路線内の継続を乗換に数えないため、ここでまとめて表示 leg と乗換数を揃える。
+        let merged = merge_same_route_transit(&journey.legs);
+        let last_idx = merged.len().saturating_sub(1);
         // 発地→着地を順に辿るカーソル (直前 leg の到達地点)。徒歩 leg の from/to 名前・
         // 座標を、その両端 (出発地/目的地 or 駅) から解決するために使う。
         let mut cursor_name = "出発地".to_string();
         let mut cursor_coord = req.origin;
 
-        let mut legs: Vec<Leg> = Vec::with_capacity(journey.legs.len());
-        for (i, leg) in journey.legs.iter().enumerate() {
+        let mut legs: Vec<Leg> = Vec::with_capacity(merged.len());
+        for (i, leg) in merged.iter().enumerate() {
             match leg {
                 otp_raptor::JourneyLeg::Walk { stop, duration_s } => {
                     let stop_name = self.timetable.stop_name(*stop).to_string();
@@ -288,10 +317,12 @@ impl Engine {
             }
         }
 
+        // 乗換数はまとめ後の Transit 本数 - 1 (アクセス/イグレス徒歩や同一路線内継続は数えない)。
+        let transit_count = merged.iter().filter(|l| matches!(l, otp_raptor::JourneyLeg::Transit { .. })).count();
         Itinerary {
             legs,
             total_duration_s: (journey.arrival_s - req.depart_at).max(0) as u32,
-            transfers: journey.transfers,
+            transfers: transit_count.saturating_sub(1) as u8,
             fare_yen: self.compute_fare(journey),
         }
     }
@@ -373,5 +404,44 @@ mod tests {
             Mobility::Stroller.walk_profile().stairs_reluctance,
             WalkProfile::stroller().stairs_reluctance
         );
+    }
+
+    #[test]
+    fn merge_collapses_same_route_same_stop_but_keeps_real_transfers() {
+        use otp_core::{RouteId, TripId};
+        use otp_raptor::JourneyLeg;
+        let transit = |route: &str, from: u32, to: u32, board: i32, alight: i32| JourneyLeg::Transit {
+            route_id: RouteId::new(route),
+            route_short_name: route.into(),
+            route_long_name: route.into(),
+            route_type: otp_gtfs::RouteType::Subway,
+            agency_id: "toei".into(),
+            trip_id: TripId::new("t"),
+            from,
+            to,
+            board_s: board,
+            alight_s: alight,
+        };
+        // (A) 同一路線(大江戸線)を都庁前(stop5)で分割した連続 Transit → 1本に統合。
+        let split = vec![transit("Oedo", 1, 5, 28800, 28860), transit("Oedo", 5, 9, 28860, 29760)];
+        let m = merge_same_route_transit(&split);
+        assert_eq!(m.len(), 1, "同一路線・同一停留所の連続は1本に");
+        match &m[0] {
+            JourneyLeg::Transit { from, to, board_s, alight_s, .. } => {
+                assert_eq!((*from, *to, *board_s, *alight_s), (1, 9, 28800, 29760), "先頭from/board〜末尾to/alightに伸びる");
+            }
+            _ => panic!("Transitのはず"),
+        }
+        // (B) 別路線の同一駅乗換 (大江戸線→丸ノ内線) は正当な乗換として残す。
+        let xfer = vec![transit("Oedo", 1, 5, 28800, 28860), transit("Marunouchi", 5, 9, 28900, 29200)];
+        assert_eq!(merge_same_route_transit(&xfer).len(), 2, "別路線は統合しない");
+        // (C) 同一路線でも Walk (別駅への徒歩乗換) を挟むなら残す。
+        let walked = vec![
+            transit("Oedo", 1, 5, 28800, 28860),
+            JourneyLeg::Walk { stop: 6, duration_s: 120 },
+            transit("Oedo", 6, 9, 29000, 29500),
+        ];
+        let transit_n = merge_same_route_transit(&walked).iter().filter(|l| matches!(l, JourneyLeg::Transit { .. })).count();
+        assert_eq!(transit_n, 2, "Walkを挟む場合は統合しない");
     }
 }
