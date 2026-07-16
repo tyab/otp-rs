@@ -321,32 +321,55 @@ impl Engine {
     /// `origin` 近傍の駅への徒歩経路 (access) をまとめて引く。`WalkPath` を
     /// 駅ごとに保持しておき、`journey_to_itinerary` で distance_m・has_stairs の
     /// 復元に使う。
+    ///
+    /// 候補駅 (最大 [`MAX_ACCESS_EGRESS_CANDIDATES`]) それぞれに個別 A* を走らせる
+    /// 代わりに、`route_one_to_many` で **1回の Dijkstra** にまとめる (結果は各駅
+    /// への `route()` とフィールド単位で一致)。
     fn access_links(&self, origin: LatLng, profile: &WalkProfile) -> WalkLinks {
-        let candidates = self.timetable.nearby_stops(origin, ACCESS_EGRESS_RADIUS_M);
-        self.collect_walk_links(candidates, |stop_coord| self.street.route(origin, stop_coord, profile))
+        let candidates: Vec<(otp_raptor::StopIdx, LatLng)> = self
+            .timetable
+            .nearby_stops(origin, ACCESS_EGRESS_RADIUS_M)
+            .into_iter()
+            .take(MAX_ACCESS_EGRESS_CANDIDATES)
+            .collect();
+        let coords: Vec<LatLng> = candidates.iter().map(|(_, c)| *c).collect();
+        let paths = self.street.route_one_to_many(origin, &coords, profile);
+        Self::build_walk_links(candidates, paths)
     }
 
     /// `destination` 近傍の駅からの徒歩経路 (egress) をまとめて引く。
+    ///
+    /// 無向グラフなので、目的地からの **1回の Dijkstra** (`route_many_to_one`) で
+    /// 全候補駅→目的地の経路を得る (各駅への `route(stop, destination)` と一致)。
     fn egress_links(&self, destination: LatLng, profile: &WalkProfile) -> WalkLinks {
-        let candidates = self.timetable.nearby_stops(destination, ACCESS_EGRESS_RADIUS_M);
-        self.collect_walk_links(candidates, |stop_coord| self.street.route(stop_coord, destination, profile))
+        let candidates: Vec<(otp_raptor::StopIdx, LatLng)> = self
+            .timetable
+            .nearby_stops(destination, ACCESS_EGRESS_RADIUS_M)
+            .into_iter()
+            .take(MAX_ACCESS_EGRESS_CANDIDATES)
+            .collect();
+        let coords: Vec<LatLng> = candidates.iter().map(|(_, c)| *c).collect();
+        let paths = self.street.route_many_to_one(&coords, destination, profile);
+        Self::build_walk_links(candidates, paths)
     }
 
-    fn collect_walk_links(
-        &self,
+    /// 候補駅と (それに位置対応する) `WalkPath` 群から `StreetLink` 一覧と
+    /// 駅ごとの `WalkPath` マップを組む。経路が引けなかった (`None`) 駅は捨てる
+    /// (旧 `collect_walk_links` が `route()` の Err を捨てていたのと同じ挙動)。
+    fn build_walk_links(
         candidates: Vec<(otp_raptor::StopIdx, LatLng)>,
-        route_to_or_from: impl Fn(LatLng) -> otp_core::Result<otp_street::WalkPath>,
+        paths: Vec<Option<otp_street::WalkPath>>,
     ) -> WalkLinks {
         let mut links = Vec::new();
-        let mut paths = HashMap::new();
-        for (stop, stop_coord) in candidates.into_iter().take(MAX_ACCESS_EGRESS_CANDIDATES) {
-            if let Ok(path) = route_to_or_from(stop_coord) {
+        let mut path_map = HashMap::new();
+        for ((stop, _), path) in candidates.into_iter().zip(paths) {
+            if let Some(path) = path {
                 let duration_s = path.physical_duration_s.round() as u32;
                 links.push(otp_raptor::StreetLink { stop, duration_s });
-                paths.insert(stop, path);
+                path_map.insert(stop, path);
             }
         }
-        WalkLinks { links, paths }
+        WalkLinks { links, paths: path_map }
     }
 
     /// RAPTOR の `Journey` を engine の `Itinerary` へ変換する。
