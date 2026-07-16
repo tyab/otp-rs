@@ -68,6 +68,7 @@ fn shinjuku_to_hongo_sanchome_returns_sane_journey() {
         earliest_departure: 8 * 3600, // 08:00:00
         service_date: 20260713,       // 月曜日 (calendar.txt の実測値と付き合わせ済み)
         max_rounds: 4,
+        rail_only: false,
     };
 
     let journeys = tt.search(&query).expect("search should not panic/error");
@@ -114,6 +115,7 @@ fn shinjuku_to_hongo_sanchome_transfer_respects_default_buffer() {
         earliest_departure: 8 * 3600,
         service_date: 20260713,
         max_rounds: 4,
+        rail_only: false,
     };
 
     let journeys = tt.search(&query).expect("search should not panic/error");

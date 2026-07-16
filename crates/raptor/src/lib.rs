@@ -492,6 +492,11 @@ pub struct RaptorQuery {
     pub service_date: u32,
     /// 最大乗換回数 (RAPTOR のラウンド数上限)。
     pub max_rounds: u8,
+    /// 鉄道限定フラグ。`true` のとき、`route_type` が鉄道 (`RouteType::is_rail`) でない
+    /// パターン (=バス) には一切乗車しない (乗換 footpath は従来どおり有効)。同一時刻表を
+    /// 共有したまま「鉄道のみの代替経路」を第2の探索として得るために使う (バス専用の
+    /// 時刻表を別途構築せずに済む = 追加メモリなし)。既存呼び出しは `false` で従来動作。
+    pub rail_only: bool,
 }
 
 /// 探索結果の1区間。
@@ -582,6 +587,11 @@ impl Timetable {
 
             for &p in &touched_patterns {
                 let pattern = &self.patterns[p as usize];
+                // 鉄道限定探索では非鉄道パターン (バス) への乗車を丸ごとスキップする。
+                // 乗換 footpath は下段でそのまま辿るため、駅間の徒歩接続は影響を受けない。
+                if query.rail_only && !pattern.route_type.is_rail() {
+                    continue;
+                }
                 let Some(start_pos) = pattern.stops.iter().position(|s| marked.binary_search(s).is_ok()) else {
                     continue;
                 };
@@ -892,6 +902,7 @@ mod tests {
             earliest_departure: 8 * 3600, // 08:00:00
             service_date: 20260713,       // 月曜 (WD, WD_EXTRA とも運行)
             max_rounds: 2,
+            rail_only: false,
         };
 
         let journeys = tt.search(&query).expect("search should not error");
@@ -938,8 +949,75 @@ mod tests {
             earliest_departure: 8 * 3600,
             service_date: 20260714, // 火曜: WD (月曜のみ) も WD_EXTRA (calendar_datesは13日のみ) も運行なし
             max_rounds: 2,
+            rail_only: false,
         };
         let journeys = tt.search(&query).expect("search should not error");
         assert!(journeys.is_empty(), "expected no journey when nothing is running, got {journeys:?}");
+    }
+
+    #[test]
+    fn rail_only_flag_skips_faster_bus_and_returns_slower_rail() {
+        use otp_gtfs::{Calendar, Route, RouteType, Stop, StopTime, Trip, WheelchairBoarding};
+        // 同じ A→D 区間に「速いバス (08:00→08:10)」と「遅い鉄道 (08:00→08:25)」を用意する。
+        // 単一基準 RAPTOR は停留所ごとに最早ラベルしか残さないため、通常探索 (rail_only=false)
+        // ではバスが鉄道を上書きして採用される。rail_only=true ではバスへの乗車が丸ごと
+        // スキップされ、遅い鉄道が返るはず (バス経路に負けても鉄道の代替を拾える)。
+        let feed = Feed {
+            stops: vec![
+                Stop { id: StopId::new("A"), name: "A".into(), lat: 35.0, lng: 139.0, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+                Stop { id: StopId::new("D"), name: "D".into(), lat: 35.05, lng: 139.05, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+            ],
+            routes: vec![
+                Route { id: RouteId::new("RBUS"), agency_id: None, short_name: "急行バス".into(), long_name: "急行バス".into(), route_type: RouteType::Bus },
+                Route { id: RouteId::new("RRAIL"), agency_id: None, short_name: "各停".into(), long_name: "各停".into(), route_type: RouteType::Rail },
+            ],
+            trips: vec![
+                Trip { id: TripId::new("TBUS"), route_id: RouteId::new("RBUS"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown },
+                Trip { id: TripId::new("TRAIL"), route_id: RouteId::new("RRAIL"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown },
+            ],
+            stop_times: vec![
+                // バス: A 08:00 → D 08:10 (速い)
+                StopTime { trip_id: TripId::new("TBUS"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 8 * 3600, departure: 8 * 3600 },
+                StopTime { trip_id: TripId::new("TBUS"), stop_id: StopId::new("D"), stop_sequence: 2, arrival: 8 * 3600 + 600, departure: 8 * 3600 + 600 },
+                // 鉄道: A 08:00 → D 08:25 (遅い)
+                StopTime { trip_id: TripId::new("TRAIL"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 8 * 3600, departure: 8 * 3600 },
+                StopTime { trip_id: TripId::new("TRAIL"), stop_id: StopId::new("D"), stop_sequence: 2, arrival: 8 * 3600 + 1500, departure: 8 * 3600 + 1500 },
+            ],
+            calendars: vec![Calendar { service_id: otp_core::ServiceId::new("WD"), weekdays: [true, true, true, true, true, false, false], start_date: 20260101, end_date: 20301231 }],
+            ..Feed::default()
+        };
+        // バスも含めた時刻表 (RailAndBus) で構築しないと、そもそもバスパターンが載らない。
+        let tt = Timetable::build_with_modes(&[feed], ModeFilter::RailAndBus).expect("timetable should build");
+        let a = tt.stop_idx(&StopId::new("A")).unwrap();
+        let d = tt.stop_idx(&StopId::new("D")).unwrap();
+
+        let base = RaptorQuery {
+            access: vec![StreetLink { stop: a, duration_s: 0 }],
+            egress: vec![StreetLink { stop: d, duration_s: 0 }],
+            earliest_departure: 8 * 3600,
+            service_date: 20260713, // 月曜 (WD 運行)
+            max_rounds: 2,
+            rail_only: false,
+        };
+
+        // rail_only=false: 速いバスが選ばれる。
+        let fast = tt.search(&base).expect("search should not error");
+        let fast_best = fast.last().expect("expected a fast journey");
+        assert_eq!(fast_best.arrival_s, 8 * 3600 + 600, "全モードでは速いバス (08:10着) が選ばれるはず");
+        let fast_route = fast_best.legs.iter().find_map(|l| match l {
+            JourneyLeg::Transit { route_id, .. } => Some(route_id.as_str().to_string()),
+            _ => None,
+        });
+        assert_eq!(fast_route.as_deref(), Some("RBUS"), "全モードの最速はバス路線のはず");
+
+        // rail_only=true: バスはスキップされ、遅い鉄道が返る。
+        let rail = tt.search(&RaptorQuery { rail_only: true, ..base.clone() }).expect("search should not error");
+        let rail_best = rail.last().expect("expected a rail journey");
+        assert_eq!(rail_best.arrival_s, 8 * 3600 + 1500, "鉄道限定では鉄道 (08:25着) が返るはず");
+        let rail_route = rail_best.legs.iter().find_map(|l| match l {
+            JourneyLeg::Transit { route_id, route_type, .. } => Some((route_id.as_str().to_string(), *route_type)),
+            _ => None,
+        });
+        assert_eq!(rail_route, Some(("RRAIL".to_string(), RouteType::Rail)), "鉄道限定探索はバスに乗車してはいけない");
     }
 }

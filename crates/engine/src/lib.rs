@@ -116,6 +116,30 @@ fn otp_mode(rt: otp_gtfs::RouteType) -> &'static str {
     }
 }
 
+/// 2本の探索 (全モード / 鉄道限定) の結果をまとめる際の重複判定シグネチャ。
+///
+/// 「同一経路」を乗車 (`Leg::Transit`) leg の並び = 各 leg の
+/// (route_short_name + route_long_name, 発駅名 → 着駅名) の連結で表す。徒歩 leg は
+/// access/egress や footpath の些細な差で揺れるため署名に含めない (乗車の骨格が一致すれば
+/// 同一経路とみなす)。最速経路が既に全鉄道なら鉄道限定探索が同じ乗車列を返すため
+/// 署名が一致し、`plan` の dedupe で二重を防げる。
+fn itinerary_signature(it: &Itinerary) -> String {
+    let mut sig = String::new();
+    for leg in &it.legs {
+        if let Leg::Transit { route_short_name, route_long_name, from_name, to_name, .. } = leg {
+            sig.push_str(route_short_name);
+            sig.push('\u{1}');
+            sig.push_str(route_long_name);
+            sig.push('\u{1}');
+            sig.push_str(from_name);
+            sig.push_str("->");
+            sig.push_str(to_name);
+            sig.push('\u{1f}');
+        }
+    }
+    sig
+}
+
 /// 応答の1経路。
 #[derive(Debug, Clone)]
 pub struct Itinerary {
@@ -140,6 +164,11 @@ const MAX_ACCESS_EGRESS_CANDIDATES: usize = 10;
 /// RAPTOR のラウンド数上限 (=最大乗換回数+1)。ターミナル経由で乗換が増える郊外直通
 /// (例: 方南支線→丸ノ内線→京王線→京王高尾線) を拾えるよう5に (最大乗換4回)。
 const MAX_RAPTOR_ROUNDS: u8 = 5;
+
+/// 応答に載せる経路数の上限。最速 (バスになりうる) + 鉄道の代替を両立させたうえで、
+/// 密集エリアで候補が膨らんでも UI が扱いやすい控えめな本数に絞る。鉄道の代替は
+/// この上限内でも最低1本は残す (`plan` の truncate 参照)。
+const MAX_ITINERARIES: usize = 4;
 
 /// エンジン本体。構築済みグラフ/時刻表/運賃モデルを保持し、リクエストに応答する。
 ///
@@ -206,21 +235,75 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        let query = otp_raptor::RaptorQuery {
+        // 2本の探索を「同一の access/egress リンク」で走らせる (時刻表は1つを共有:
+        // 追加メモリなし)。単一基準 (最早到着) RAPTOR は停留所ごとに最早ラベルしか
+        // 残さないため、鉄道経路がバス経路に上書きされて表に出ない (方南町→高尾山口 等で
+        // 実測)。鉄道限定の第2探索を別途走らせ、バスに勝てなくても鉄道の代替を拾う。
+        //   q_fast … 全モード。最速 (バスになりうる)。
+        //   q_rail … 鉄道限定。鉄道のみの代替経路。
+        let q_fast = otp_raptor::RaptorQuery {
+            access: access.links.clone(),
+            egress: egress.links.clone(),
+            earliest_departure: req.depart_at,
+            service_date: req.service_date,
+            max_rounds: MAX_RAPTOR_ROUNDS,
+            rail_only: false,
+        };
+        let q_rail = otp_raptor::RaptorQuery {
             access: access.links,
             egress: egress.links,
             earliest_departure: req.depart_at,
             service_date: req.service_date,
             max_rounds: MAX_RAPTOR_ROUNDS,
+            rail_only: true,
         };
 
-        let journeys = self.timetable.search(&query)?;
+        let fast_journeys = self.timetable.search(&q_fast)?;
+        let rail_journeys = self.timetable.search(&q_rail)?;
 
-        let mut itineraries: Vec<Itinerary> = journeys
-            .iter()
-            .map(|j| self.journey_to_itinerary(j, req, &access.paths, &egress.paths))
-            .collect();
+        // fast を先に Itinerary 化し、乗車 leg の並び (路線名 + 発着駅名) を
+        // シグネチャにして重複排除する (fast 内の Pareto 重複も畳む)。
+        let mut fast_its: Vec<Itinerary> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for j in &fast_journeys {
+            let it = self.journey_to_itinerary(j, req, &access.paths, &egress.paths);
+            if seen.insert(itinerary_signature(&it)) {
+                fast_its.push(it);
+            }
+        }
+        // 鉄道限定の結果のうち、fast に既出でない経路だけを「鉄道の代替」として拾う。
+        // 最速経路が既に全鉄道なら鉄道限定探索は同じ経路を返す (シグネチャ一致) ので、
+        // ここで弾かれ二重にならない。鉄道が到達不能なら rail_journeys は空で、
+        // 代替は増えない (fast だけを返す = クラッシュも重複もなし)。
+        let mut rail_its: Vec<Itinerary> = Vec::new();
+        for j in &rail_journeys {
+            let it = self.journey_to_itinerary(j, req, &access.paths, &egress.paths);
+            if seen.insert(itinerary_signature(&it)) {
+                rail_its.push(it);
+            }
+        }
+
+        // 到着が早い順に並べ、表示上限 MAX_ITINERARIES に絞る。ただし鉄道の代替は
+        // バスより遅くても最低1本は残す (単純 truncate では fast が MAX_ITINERARIES 本
+        // Pareto で埋めると鉄道が押し出されうるため、明示的に枠を確保する)。
+        fast_its.sort_by_key(|it| it.total_duration_s);
+        rail_its.sort_by_key(|it| it.total_duration_s);
+        let mut itineraries = fast_its;
+        itineraries.extend(rail_its.iter().cloned());
         itineraries.sort_by_key(|it| it.total_duration_s);
+        if itineraries.len() > MAX_ITINERARIES {
+            itineraries.truncate(MAX_ITINERARIES);
+            // 上限内に鉄道の代替が1本も残らなかったら、末尾を最速の鉄道代替で差し替える。
+            if let Some(best_rail) = rail_its.first() {
+                let rail_sig = itinerary_signature(best_rail);
+                let has_rail = itineraries.iter().any(|it| itinerary_signature(it) == rail_sig);
+                if !has_rail {
+                    let last = itineraries.len() - 1;
+                    itineraries[last] = best_rail.clone();
+                    itineraries.sort_by_key(|it| it.total_duration_s);
+                }
+            }
+        }
         Ok(itineraries)
     }
 
