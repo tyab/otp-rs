@@ -259,7 +259,6 @@ impl Engine {
         };
 
         let fast_journeys = self.timetable.search(&q_fast)?;
-        let rail_journeys = self.timetable.search(&q_rail)?;
 
         // fast を先に Itinerary 化し、乗車 leg の並び (路線名 + 発着駅名) を
         // シグネチャにして重複排除する (fast 内の Pareto 重複も畳む)。
@@ -271,15 +270,25 @@ impl Engine {
                 fast_its.push(it);
             }
         }
-        // 鉄道限定の結果のうち、fast に既出でない経路だけを「鉄道の代替」として拾う。
-        // 最速経路が既に全鉄道なら鉄道限定探索は同じ経路を返す (シグネチャ一致) ので、
-        // ここで弾かれ二重にならない。鉄道が到達不能なら rail_journeys は空で、
-        // 代替は増えない (fast だけを返す = クラッシュも重複もなし)。
+
+        // 鉄道限定の第2探索は「最速がバスを含む」ときだけ走らせる。最速が既に全鉄道なら
+        // 鉄道限定は同じ経路を返すだけ (シグネチャ一致で弾かれ代替にならない) ので無駄。
+        // これで大半の都心OD (全鉄道) は探索1回で済み、2回分の遅延 (Worker側タイムアウト
+        // 境界に達しうる) を避けられる。バスが最速のときだけ鉄道の代替を別途拾う。
+        let fast_has_bus = fast_its
+            .iter()
+            .any(|it| it.legs.iter().any(|l| matches!(l, Leg::Transit { mode, .. } if *mode == "BUS")));
+
         let mut rail_its: Vec<Itinerary> = Vec::new();
-        for j in &rail_journeys {
-            let it = self.journey_to_itinerary(j, req, &access.paths, &egress.paths);
-            if seen.insert(itinerary_signature(&it)) {
-                rail_its.push(it);
+        if fast_has_bus {
+            let rail_journeys = self.timetable.search(&q_rail)?;
+            // 鉄道限定の結果のうち、fast に既出でない経路だけを「鉄道の代替」として拾う。
+            // 鉄道が到達不能なら rail_journeys は空で代替は増えない (fast だけを返す)。
+            for j in &rail_journeys {
+                let it = self.journey_to_itinerary(j, req, &access.paths, &egress.paths);
+                if seen.insert(itinerary_signature(&it)) {
+                    rail_its.push(it);
+                }
             }
         }
 
