@@ -273,16 +273,17 @@ impl Engine {
             }
         }
 
-        // 鉄道限定の第2探索は「最速がバスを含む」ときだけ走らせる。最速が既に全鉄道なら
-        // 鉄道限定は同じ経路を返すだけ (シグネチャ一致で弾かれ代替にならない) ので無駄。
-        // これで大半の都心OD (全鉄道) は探索1回で済み、2回分の遅延 (Worker側タイムアウト
-        // 境界に達しうる) を避けられる。バスが最速のときだけ鉄道の代替を別途拾う。
-        let fast_has_bus = fast_its
+        // 鉄道限定の第2探索は「最速経路がバスを含む」ときだけ走らせる。最速が既に鉄道なら
+        // それが答えで、遅い鉄道代替を別途出す必要はない (Pareto集合に遅いバスが混じっても
+        // 最速が鉄道なら第2探索は無駄)。最速 itinerary だけで判定することで、全鉄道が最速の
+        // 高密度OD (新宿→東京 等) を単一探索に保ち、2回分の遅延を避ける。
+        let fastest_has_bus = fast_its
             .iter()
-            .any(|it| it.legs.iter().any(|l| matches!(l, Leg::Transit { mode, .. } if *mode == "BUS")));
+            .min_by_key(|it| it.total_duration_s)
+            .is_some_and(|it| it.legs.iter().any(|l| matches!(l, Leg::Transit { mode, .. } if *mode == "BUS")));
 
         let mut rail_its: Vec<Itinerary> = Vec::new();
-        if fast_has_bus {
+        if fastest_has_bus {
             let rail_journeys = self.timetable.search(&q_rail)?;
             // 鉄道限定の結果のうち、fast に既出でない経路だけを「鉄道の代替」として拾う。
             // 鉄道が到達不能なら rail_journeys は空で代替は増えない (fast だけを返す)。
