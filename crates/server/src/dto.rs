@@ -39,6 +39,10 @@ pub struct PlanRequestDto {
     #[serde(rename = "serviceDate")]
     pub service_date: u32,
     pub mobility: String,
+    /// arrive-by (到着時刻指定) フラグ。省略時は false (depart-at)。true のとき
+    /// `departAt` は「到着締切時刻」を意味する (`otp_engine::RouteRequest::arrive_by`)。
+    #[serde(rename = "arriveBy", default)]
+    pub arrive_by: bool,
 }
 
 impl PlanRequestDto {
@@ -61,6 +65,7 @@ impl PlanRequestDto {
             depart_at,
             service_date: self.service_date,
             mobility,
+            arrive_by: self.arrive_by,
         })
     }
 }
@@ -209,6 +214,22 @@ mod tests {
     }
 
     #[test]
+    fn arrive_by_defaults_false_and_parses_when_present() {
+        // arriveBy 省略時は depart-at (false)。
+        let body = r#"{"origin":{"lat":35.69,"lng":139.70},"destination":{"lat":35.707,"lng":139.759},
+                        "departAt":"08:00","serviceDate":20260713,"mobility":"solo"}"#;
+        let req = serde_json::from_str::<PlanRequestDto>(body).unwrap().into_route_request().unwrap();
+        assert!(!req.arrive_by, "arriveBy 省略時は false");
+
+        // arriveBy:true なら arrive-by (departAt は到着締切として扱われる)。
+        let body = r#"{"origin":{"lat":35.69,"lng":139.70},"destination":{"lat":35.707,"lng":139.759},
+                        "departAt":"09:00","serviceDate":20260713,"mobility":"solo","arriveBy":true}"#;
+        let req = serde_json::from_str::<PlanRequestDto>(body).unwrap().into_route_request().unwrap();
+        assert!(req.arrive_by, "arriveBy:true は arrive_by=true");
+        assert_eq!(req.depart_at, 9 * 3600, "departAt は arrive-by でも時刻フィールド (到着締切)");
+    }
+
+    #[test]
     fn unknown_mobility_is_rejected() {
         let body = r#"{"origin":{"lat":35.69,"lng":139.70},"destination":{"lat":35.707,"lng":139.759},
                         "departAt":"08:00","serviceDate":20260713,"mobility":"bicycle"}"#;
@@ -255,6 +276,7 @@ mod tests {
             total_duration_s: 1400,
             transfers: 0,
             fare_yen: Some(220.0),
+            depart_s: 8 * 3600,
         }];
         let dto = PlanResponseDto::from_itineraries(&itineraries);
         let json = serde_json::to_string(&dto).expect("should serialize");

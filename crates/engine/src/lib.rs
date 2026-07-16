@@ -39,6 +39,10 @@ pub struct RouteRequest {
     /// 無かったが、日付を跨ぐ運行判定なしに `plan()` は組めないため追加した。
     pub service_date: u32,
     pub mobility: Mobility,
+    /// arrive-by (到着時刻指定) フラグ。`true` のとき `depart_at` は「目的地への到着締切
+    /// 時刻」を意味し、RAPTOR を後方探索 (最遅出発) で回す (`RaptorQuery::arrive_by`)。
+    /// `false` なら従来どおり `depart_at` を出発時刻とする前方探索。
+    pub arrive_by: bool,
 }
 
 /// 応答の1区間 (徒歩 or 乗車)。
@@ -148,6 +152,11 @@ pub struct Itinerary {
     pub transfers: u8,
     /// 運賃 (円)。運賃データが無い区間を含む場合は None。
     pub fare_yen: Option<f64>,
+    /// この経路が実際に出発地を発つ絶対時刻 (0時からの秒)。depart-at では `req.depart_at`
+    /// と一致するが、arrive-by (`req.arrive_by`) では締切から逆算した **最遅出発時刻** に
+    /// なる (経路ごとに異なりうる)。応答の start/end 時刻の anchor に使う (`total_duration_s`
+    /// と合わせて到着 = `depart_s + total_duration_s`)。
+    pub depart_s: SecondsSinceMidnight,
 }
 
 /// access/egress 徒歩探索で近傍駅を探す半径 (メートル)。OTP の `maxAccessEgressDuration`
@@ -250,6 +259,7 @@ impl Engine {
             service_date: req.service_date,
             max_rounds: MAX_RAPTOR_ROUNDS,
             rail_only: false,
+            arrive_by: req.arrive_by,
         };
         let q_rail = otp_raptor::RaptorQuery {
             access: access.links,
@@ -258,6 +268,7 @@ impl Engine {
             service_date: req.service_date,
             max_rounds: MAX_RAPTOR_ROUNDS,
             rail_only: true,
+            arrive_by: req.arrive_by,
         };
 
         let fast_journeys = self.timetable.search(&q_fast)?;
@@ -446,11 +457,16 @@ impl Engine {
 
         // 乗換数はまとめ後の Transit 本数 - 1 (アクセス/イグレス徒歩や同一路線内継続は数えない)。
         let transit_count = merged.iter().filter(|l| matches!(l, otp_raptor::JourneyLeg::Transit { .. })).count();
+        // 出発地を発つ絶対時刻。depart-at では `req.depart_at` (=出発時刻) そのまま (従来動作を
+        // バイト単位で保つ)。arrive-by では締切から逆算した最遅出発時刻を経路から復元する
+        // (先頭 Transit の board − それより前の徒歩 = access 徒歩の合計)。
+        let depart_s = if req.arrive_by { journey_departure_s(journey) } else { req.depart_at };
         Itinerary {
             legs,
-            total_duration_s: (journey.arrival_s - req.depart_at).max(0) as u32,
+            total_duration_s: (journey.arrival_s - depart_s).max(0) as u32,
             transfers: transit_count.saturating_sub(1) as u8,
             fare_yen: self.compute_fare(journey),
+            depart_s,
         }
     }
 
@@ -505,6 +521,22 @@ impl Engine {
         }
         Some(total)
     }
+}
+
+/// 経路が実際に出発地を発つ絶対時刻 (0時からの秒) を `Journey` から復元する。
+/// 先頭 Transit の board 時刻から、それより前に現れる徒歩 leg (access 徒歩) の所要合計を
+/// 差し引く (出発地を出て access 徒歩を経て最初の便に乗る = board − access 徒歩)。arrive-by の
+/// 最遅出発時刻の算出に使う。Transit を含まない経路 (通常 RAPTOR では発生しない) は
+/// 到着時刻をそのまま返す (所要0扱いのフォールバック)。
+fn journey_departure_s(journey: &otp_raptor::Journey) -> SecondsSinceMidnight {
+    let mut walk_before: i32 = 0;
+    for leg in &journey.legs {
+        match leg {
+            otp_raptor::JourneyLeg::Walk { duration_s, .. } => walk_before += *duration_s as i32,
+            otp_raptor::JourneyLeg::Transit { board_s, .. } => return board_s - walk_before,
+        }
+    }
+    journey.arrival_s
 }
 
 /// 名前空間化済み ID (`"<feed_prefix>:<raw_id>"`, `otp_gtfs::Feed::namespace` 参照) から

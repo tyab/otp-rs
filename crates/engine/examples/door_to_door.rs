@@ -116,7 +116,7 @@ fn main() {
         FEEDS.iter().zip(feeds.iter()).map(|((prefix, _), feed)| (prefix.to_string(), FareModel::from_gtfs(feed))).collect();
 
     let engine = Engine::new(street, timetable, fares);
-    let req = RouteRequest { origin, destination, depart_at, service_date, mobility };
+    let req = RouteRequest { origin, destination, depart_at, service_date, mobility, arrive_by: false };
 
     let t2 = std::time::Instant::now();
     let itineraries = engine.plan(&req).expect("plan failed");

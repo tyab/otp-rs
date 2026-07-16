@@ -75,6 +75,7 @@ fn cross_operator_transfer_at_shirokanetakanawa_is_found() {
         service_date: 20260713,
         max_rounds: 4,
         rail_only: false,
+        arrive_by: false,
     };
 
     let journeys = tt.search(&query).expect("search should not panic/error");

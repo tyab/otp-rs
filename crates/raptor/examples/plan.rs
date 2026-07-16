@@ -106,6 +106,7 @@ fn main() {
         service_date,
         max_rounds: 4,
         rail_only: false,
+        arrive_by: false,
     };
 
     let journeys = tt.search(&query).expect("search failed");

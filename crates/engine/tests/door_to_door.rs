@@ -150,6 +150,7 @@ fn request(mobility: Mobility) -> RouteRequest {
         depart_at: 7 * 3600 + 50 * 60,
         service_date: 20260713, // 月曜
         mobility,
+        arrive_by: false,
     }
 }
 

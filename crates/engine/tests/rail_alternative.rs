@@ -95,6 +95,7 @@ fn request() -> RouteRequest {
         depart_at: 7 * 3600 + 57 * 60,
         service_date: 20260713, // 月曜 (WD 運行)
         mobility: Mobility::Solo,
+        arrive_by: false,
     }
 }
 

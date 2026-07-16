@@ -59,6 +59,7 @@ fn base_request(mobility: Mobility) -> RouteRequest {
         depart_at: 7 * 3600 + 57 * 60,
         service_date: 20260713, // 月曜 (mini fixture の WD/WD_EXTRA とも運行)
         mobility,
+        arrive_by: false,
     }
 }
 

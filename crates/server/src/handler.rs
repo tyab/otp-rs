@@ -91,17 +91,20 @@ pub fn handle_gtfs_graphql(engine: &Engine, body: &[u8]) -> Result<String, ApiEr
     let vars = v.get("variables").cloned().unwrap_or(Value::Null);
     let origin = parse_coord(&vars, "origin").ok_or_else(|| ApiError::bad_request("origin coordinate missing"))?;
     let destination = parse_coord(&vars, "destination").ok_or_else(|| ApiError::bad_request("destination coordinate missing"))?;
-    let (service_date, depart_at) = parse_datetime(vars.get("dateTime"));
+    let (service_date, depart_at, arrive_by) = parse_datetime(vars.get("dateTime"));
     // babymobi は wheelchair=true/false の2クエリを投げる (engine.ts)。true=車いす相当
     // (段差を強く避ける)、false=通常徒歩。ベビーカーは true 由来経路を推奨に寄せる設計。
     let wheelchair = vars.get("wheelchair").and_then(Value::as_bool).unwrap_or(false);
     let mobility = if wheelchair { Mobility::Wheelchair } else { Mobility::Solo };
 
-    let request = RouteRequest { origin, destination, depart_at, service_date, mobility };
+    // arrive_by のとき depart_at は「到着締切時刻」を表す (engine が後方 RAPTOR を回す)。
+    let request = RouteRequest { origin, destination, depart_at, service_date, mobility, arrive_by };
     let itineraries = engine.plan(&request).map_err(|e| ApiError::internal(format!("plan failed: {e}")))?;
 
+    // start/end の anchor は各経路の実出発時刻 (`Itinerary::depart_s`)。arrive-by では締切から
+    // 逆算した最遅出発で経路ごとに異なるため、単一の depart_at では anchor できない。
     let edges: Vec<Value> =
-        itineraries.iter().map(|it| json!({ "node": itinerary_to_node(it, service_date, depart_at) })).collect();
+        itineraries.iter().map(|it| json!({ "node": itinerary_to_node(it, service_date) })).collect();
     let resp = json!({ "data": { "planConnection": { "routingErrors": [], "edges": edges } } });
     Ok(resp.to_string())
 }
@@ -115,18 +118,25 @@ fn parse_coord(vars: &Value, key: &str) -> Option<LatLng> {
 }
 
 /// `dateTime` (earliestDeparture / latestArrival の ISO8601、または null) を
-/// (service_date=YYYYMMDD, depart_at=0時からの秒) に。null は現在時刻(JST)。
-/// arriveBy(latestArrival) は本エンジンが出発時刻探索のみのため出発時刻として近似する。
-fn parse_datetime(dt: Option<&Value>) -> (u32, i32) {
-    // earliestDeparture が明示的に null で latestArrival が入る形 (arriveBy) でも拾えるよう、
-    // 各キーに as_str を適用してから or_else でフォールバックする (Codexレビュー指摘 P2)。
-    let iso = dt.and_then(|d| {
-        d.get("earliestDeparture").and_then(Value::as_str).or_else(|| d.get("latestArrival").and_then(Value::as_str))
-    });
-    match iso.and_then(parse_iso_datetime) {
-        Some(v) => v,
-        None => now_jst(),
+/// (service_date=YYYYMMDD, time=0時からの秒, arrive_by) に。null は現在時刻(JST)の depart-at。
+///
+/// `latestArrival` が入っていれば arrive-by (到着締切) モード = `time` は到着締切時刻、
+/// `arrive_by=true`。`earliestDeparture` なら depart-at (出発時刻) モード = `arrive_by=false`。
+/// エンジンが後方 RAPTOR (最遅出発) を実装したため、arriveBy を出発時刻として近似することは
+/// もう無い (latestArrival はそのまま締切として `RouteRequest.arrive_by` に流す)。
+fn parse_datetime(dt: Option<&Value>) -> (u32, i32, bool) {
+    // earliestDeparture を優先し、無ければ latestArrival (arriveBy) を見る。どちらが
+    // 入っていたかで depart-at / arrive-by を判別する。
+    let departure = dt.and_then(|d| d.get("earliestDeparture").and_then(Value::as_str));
+    if let Some((date, s)) = departure.and_then(parse_iso_datetime) {
+        return (date, s, false);
     }
+    let arrival = dt.and_then(|d| d.get("latestArrival").and_then(Value::as_str));
+    if let Some((date, s)) = arrival.and_then(parse_iso_datetime) {
+        return (date, s, true);
+    }
+    let (date, s) = now_jst();
+    (date, s, false)
 }
 
 /// "YYYY-MM-DDThh:mm:ss[±hh:mm|Z]" から (YYYYMMDD, 0時からの秒)。TZ は無視 (GTFS も
@@ -154,9 +164,13 @@ fn now_jst() -> (u32, i32) {
     ((y as u32) * 10000 + (m as u32) * 100 + d as u32, jst.rem_euclid(86400) as i32)
 }
 
-fn itinerary_to_node(it: &Itinerary, service_date: u32, depart_at: i32) -> Value {
-    let start = format_iso(service_date, depart_at);
-    let total = depart_at + it.total_duration_s as i32;
+fn itinerary_to_node(it: &Itinerary, service_date: u32) -> Value {
+    // start = 実出発時刻 (depart-at では req.depart_at と一致、arrive-by では最遅出発)。
+    // end = start + total_duration = 実到着時刻 (arrive-by では締切 T 以下)。depart-at では
+    // depart_s ∈ [0,86400) なので日跨ぎ補正は end 側だけに効き、従来出力と一致する。
+    let depart_s = it.depart_s;
+    let total = depart_s + it.total_duration_s as i32;
+    let start = format_iso(add_days(service_date, (depart_s.div_euclid(86400)) as i64), depart_s.rem_euclid(86400));
     let end = format_iso(add_days(service_date, (total.div_euclid(86400)) as i64), total.rem_euclid(86400));
     let legs: Vec<Value> = it.legs.iter().map(leg_to_json).collect();
     json!({ "start": start, "end": end, "legs": legs })
@@ -312,6 +326,54 @@ mod tests {
     #[test]
     fn health_json_reports_ok() {
         assert_eq!(health_json(), r#"{"status":"ok"}"#);
+    }
+
+    #[test]
+    fn parse_datetime_latest_arrival_sets_arrive_by_and_earliest_departure_does_not() {
+        use serde_json::json;
+        // latestArrival → arrive-by (到着締切) モード。
+        let arrive = json!({ "latestArrival": "2026-07-13T09:00:00+09:00" });
+        let (date, s, arrive_by) = parse_datetime(Some(&arrive));
+        assert_eq!(date, 20260713);
+        assert_eq!(s, 9 * 3600);
+        assert!(arrive_by, "latestArrival は arrive_by=true のはず");
+
+        // earliestDeparture → depart-at (出発時刻) モード。
+        let depart = json!({ "earliestDeparture": "2026-07-13T08:00:00+09:00" });
+        let (date, s, arrive_by) = parse_datetime(Some(&depart));
+        assert_eq!(date, 20260713);
+        assert_eq!(s, 8 * 3600);
+        assert!(!arrive_by, "earliestDeparture は arrive_by=false のはず");
+
+        // 両方あれば earliestDeparture を優先 (depart-at)。
+        let both = json!({ "earliestDeparture": "2026-07-13T08:00:00+09:00", "latestArrival": "2026-07-13T09:00:00+09:00" });
+        let (_, s, arrive_by) = parse_datetime(Some(&both));
+        assert_eq!(s, 8 * 3600, "earliestDeparture 優先");
+        assert!(!arrive_by);
+    }
+
+    #[test]
+    fn gtfs_graphql_arrive_by_node_end_is_not_after_deadline() {
+        // latestArrival (arrive-by) の planConnection では、返る node.end (実到着) が締切以下で
+        // なければならない (mini fixture: A→C→D, 各便 08時台, D着 08:30)。締切 09:00 で問い合わせる。
+        let engine = build_engine();
+        let body = format!(
+            r#"{{"query":"planConnection","variables":{{
+                "origin":{{"location":{{"coordinate":{{"latitude":{},"longitude":{}}}}}}},
+                "destination":{{"location":{{"coordinate":{{"latitude":{},"longitude":{}}}}}}},
+                "dateTime":{{"latestArrival":"2026-07-13T09:00:00+09:00"}},
+                "wheelchair":false}}}}"#,
+            ORIGIN_NEAR_A.lat, ORIGIN_NEAR_A.lng, DEST_NEAR_D.lat, DEST_NEAR_D.lng
+        );
+        let json = handle_gtfs_graphql(&engine, body.as_bytes()).expect("should succeed");
+        let v: Value = serde_json::from_str(&json).expect("valid json");
+        let edges = v["data"]["planConnection"]["edges"].as_array().expect("edges array");
+        assert!(!edges.is_empty(), "arrive-by で経路が返るはず: {json}");
+        for edge in edges {
+            let end = edge["node"]["end"].as_str().expect("end iso");
+            // 締切 09:00 以下 (ISO 文字列は同一 TZ 前提で辞書順比較可)。
+            assert!(end.as_bytes() <= "2026-07-13T09:00:00+09:00".as_bytes(), "node.end {end} は締切 09:00 以下のはず");
+        }
     }
 
     #[test]
