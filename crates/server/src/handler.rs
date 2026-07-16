@@ -172,7 +172,7 @@ fn geometry_json(coords: &[LatLng]) -> Value {
 
 fn leg_to_json(leg: &Leg) -> Value {
     match leg {
-        Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s, geometry, .. } => json!({
+        Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s, has_stairs, has_elevator, geometry } => json!({
             "mode": "WALK",
             "duration": duration_s,
             "distance": distance_m,
@@ -180,6 +180,10 @@ fn leg_to_json(leg: &Leg) -> Value {
             "to": place_json(to_name, *to_coord),
             "route": Value::Null,
             "agency": Value::Null,
+            // OTP 標準の Leg には無い拡張フィールド (babymobi mapper が読む)。徒歩区間の
+            // 段差/エレベーターは OSM 由来の実データ。
+            "hasStairs": has_stairs,
+            "hasElevator": has_elevator,
             "legGeometry": geometry_json(geometry),
         }),
         Leg::Transit { route_short_name, route_long_name, mode, agency_id, from_name, from_coord, to_name, to_coord, duration_s } => json!({

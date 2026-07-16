@@ -56,6 +56,8 @@ pub enum Leg {
         distance_m: f32,
         duration_s: u32,
         has_stairs: bool,
+        /// この徒歩区間がエレベーターを経由するか (アクセシビリティ明示用)。
+        has_elevator: bool,
         /// 地図表示用の折れ線 (始点→終点)。access/egress は街路A*の実経路、
         /// 近接駅の footpath 乗換は 2点直線。
         geometry: Vec<LatLng>,
@@ -275,29 +277,29 @@ impl Engine {
                 otp_raptor::JourneyLeg::Walk { stop, duration_s } => {
                     let stop_name = self.timetable.stop_name(*stop).to_string();
                     let stop_coord = self.timetable.stop_coord(*stop);
-                    let (from_name, from_coord, to_name, to_coord, distance_m, has_stairs, geometry) = if i == 0 {
+                    let (from_name, from_coord, to_name, to_coord, distance_m, has_stairs, has_elevator, geometry) = if i == 0 {
                         // access: 出発地 → 乗車駅。街路A*の実経路をジオメトリに。
                         let p = access_paths.get(stop);
                         let geom = p.map(|p| self.street.path_coords(p)).unwrap_or_default();
-                        let (d, s) = p.map(|p| (p.distance_m, p.has_stairs)).unwrap_or((0.0, false));
-                        (cursor_name.clone(), cursor_coord, stop_name, stop_coord, d, s, geom)
+                        let (d, s, e) = p.map(|p| (p.distance_m, p.has_stairs, p.has_elevator)).unwrap_or((0.0, false, false));
+                        (cursor_name.clone(), cursor_coord, stop_name, stop_coord, d, s, e, geom)
                     } else if i == last_idx {
                         // egress: 降車駅 → 目的地。
                         let p = egress_paths.get(stop);
                         let geom = p.map(|p| self.street.path_coords(p)).unwrap_or_default();
-                        let (d, s) = p.map(|p| (p.distance_m, p.has_stairs)).unwrap_or((0.0, false));
-                        (cursor_name.clone(), cursor_coord, "目的地".to_string(), req.destination, d, s, geom)
+                        let (d, s, e) = p.map(|p| (p.distance_m, p.has_stairs, p.has_elevator)).unwrap_or((0.0, false, false));
+                        (cursor_name.clone(), cursor_coord, "目的地".to_string(), req.destination, d, s, e, geom)
                     } else {
-                        // RAPTOR 内部の近接駅徒歩乗換 (footpath)。直線距離近似のため距離は
+                        // RAPTOR 内部の近接駅徒歩乗換 (footpath)。直線距離近似のため距離・段差は
                         // 保持せず、ジオメトリは 2点直線 (otp_raptor モジュール doc 参照)。
-                        (cursor_name.clone(), cursor_coord, stop_name.clone(), stop_coord, 0.0, false, vec![cursor_coord, stop_coord])
+                        (cursor_name.clone(), cursor_coord, stop_name.clone(), stop_coord, 0.0, false, false, vec![cursor_coord, stop_coord])
                     };
                     // access 以外はジオメトリが空になりうる (footpath は上で2点直線を入れた
                     // ので空にならないが、街路経路が取れなかった端点用のフォールバック)。
                     let geometry = if geometry.len() >= 2 { geometry } else { vec![from_coord, to_coord] };
                     cursor_name = to_name.clone();
                     cursor_coord = to_coord;
-                    legs.push(Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s: *duration_s, has_stairs, geometry });
+                    legs.push(Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s: *duration_s, has_stairs, has_elevator, geometry });
                 }
                 otp_raptor::JourneyLeg::Transit { route_short_name, route_long_name, route_type, agency_id, from, to, board_s, alight_s, .. } => {
                     let from_name = self.timetable.stop_name(*from).to_string();

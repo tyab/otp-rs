@@ -237,6 +237,7 @@ mod tests {
                     distance_m: 120.5,
                     duration_s: 90,
                     has_stairs: false,
+                    has_elevator: false,
                     geometry: vec![LatLng::new(35.69, 139.70), LatLng::new(35.691, 139.70)],
                 },
                 Leg::Transit {

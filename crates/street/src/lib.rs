@@ -311,6 +311,7 @@ impl StreetGraph {
                 duration_s: 0.0,
                 physical_duration_s: 0.0,
                 has_stairs: false,
+                has_elevator: false,
             });
         }
 
@@ -375,11 +376,13 @@ impl StreetGraph {
         let mut nodes = vec![goal];
         let mut distance_m = 0.0f32;
         let mut has_stairs = false;
+        let mut has_elevator = false;
         let mut cur = goal;
         while let Some((parent, edge_idx)) = came_from[cur as usize] {
             let edge = &self.edges[edge_idx];
             distance_m += edge.length_m;
             has_stairs |= edge.has_stairs;
+            has_elevator |= edge.has_elevator;
             nodes.push(parent);
             cur = parent;
         }
@@ -390,6 +393,7 @@ impl StreetGraph {
             duration_s: g_score[goal as usize],
             physical_duration_s: 0.0, // route() が呼び出し後に埋める (ここでは profile を持たない)
             has_stairs,
+            has_elevator,
         }
     }
 }
@@ -438,6 +442,8 @@ pub struct WalkPath {
     pub physical_duration_s: f32,
     /// 経路に階段が含まれるか (UI の警告用)。
     pub has_stairs: bool,
+    /// 経路がエレベーターを経由するか (UI のアクセシビリティ明示用)。
+    pub has_elevator: bool,
 }
 
 #[cfg(test)]
