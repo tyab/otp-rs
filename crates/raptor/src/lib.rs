@@ -58,6 +58,11 @@ pub struct PatternTrip {
     pub service_id: otp_core::ServiceId,
     pub arrivals: Vec<SecondsSinceMidnight>,
     pub departures: Vec<SecondsSinceMidnight>,
+    /// 車両バリアフリー可否 (`trips.wheelchair_accessible`)。`RaptorQuery::require_wheelchair`
+    /// が真のとき、明示的に `NotAccessible` (=2) の便には乗車しない。`Unknown` (=空欄, 実測:
+    /// 東京の多くのフィードは空) は従来どおり乗車を許す (OTP の unknownCost 相当に倣い、
+    /// 情報欠損を理由に候補を消しすぎない)。
+    pub wheelchair_accessible: otp_gtfs::WheelchairBoarding,
 }
 
 /// 同一停車パターン (停留所の並びが完全一致する便の集合)。
@@ -174,7 +179,10 @@ impl Timetable {
 
         for feed in feeds {
             for stop in &feed.stops {
-                let canonical = stop.parent_station.clone().unwrap_or_else(|| stop.id.clone());
+                let canonical = stop
+                    .parent_station
+                    .clone()
+                    .unwrap_or_else(|| stop.id.clone());
                 canonical_of.insert(stop.id.clone(), canonical.clone());
                 if !stop_lookup.contains_key(&canonical) {
                     let idx = stop_ids.len() as StopIdx;
@@ -191,7 +199,9 @@ impl Timetable {
 
                 // 最初に見つかった非空の zone_id / 名前を採用 (struct doc 参照)。
                 if let Some(z) = &stop.zone_id {
-                    zone_of.entry(canonical.clone()).or_insert_with(|| z.clone());
+                    zone_of
+                        .entry(canonical.clone())
+                        .or_insert_with(|| z.clone());
                 }
                 // 名前は「その正規化停留所自身 (親駅 or 単独駅)」の名前を優先し、
                 // 無ければプラットフォーム名で埋める (例: parent_station C の名前 "C駅" を
@@ -201,7 +211,9 @@ impl Timetable {
                     if stop.id == canonical {
                         name_of.insert(canonical.clone(), stop.name.clone());
                     } else {
-                        name_of.entry(canonical.clone()).or_insert_with(|| stop.name.clone());
+                        name_of
+                            .entry(canonical.clone())
+                            .or_insert_with(|| stop.name.clone());
                     }
                 }
             }
@@ -232,7 +244,10 @@ impl Timetable {
         for feed in feeds {
             for st in &feed.stop_times {
                 if trip_route.contains_key(&st.trip_id) {
-                    stop_times_by_trip.entry(st.trip_id.clone()).or_default().push(st);
+                    stop_times_by_trip
+                        .entry(st.trip_id.clone())
+                        .or_default()
+                        .push(st);
                 }
             }
         }
@@ -260,8 +275,13 @@ impl Timetable {
             let stops: Vec<StopIdx> = sts
                 .iter()
                 .map(|st| {
-                    let canonical = canonical_of.get(&st.stop_id).cloned().unwrap_or_else(|| st.stop_id.clone());
-                    *stop_lookup.entry(canonical).or_insert_with(|| unreachable!("stop should be pre-registered"))
+                    let canonical = canonical_of
+                        .get(&st.stop_id)
+                        .cloned()
+                        .unwrap_or_else(|| st.stop_id.clone());
+                    *stop_lookup
+                        .entry(canonical)
+                        .or_insert_with(|| unreachable!("stop should be pre-registered"))
                 })
                 .collect();
             let arrivals: Vec<SecondsSinceMidnight> = sts.iter().map(|st| st.arrival).collect();
@@ -272,10 +292,22 @@ impl Timetable {
                 let route = included_routes[&trip.route_id];
                 patterns.push(Pattern {
                     route_id: trip.route_id.clone(),
-                    route_short_name: if route.short_name.is_empty() { route.long_name.clone() } else { route.short_name.clone() },
-                    route_long_name: if route.long_name.is_empty() { route.short_name.clone() } else { route.long_name.clone() },
+                    route_short_name: if route.short_name.is_empty() {
+                        route.long_name.clone()
+                    } else {
+                        route.short_name.clone()
+                    },
+                    route_long_name: if route.long_name.is_empty() {
+                        route.short_name.clone()
+                    } else {
+                        route.long_name.clone()
+                    },
                     route_type: route.route_type,
-                    agency_id: route.agency_id.as_ref().map(|a| a.as_str().to_string()).unwrap_or_default(),
+                    agency_id: route
+                        .agency_id
+                        .as_ref()
+                        .map(|a| a.as_str().to_string())
+                        .unwrap_or_default(),
                     stops,
                     trips: Vec::new(),
                 });
@@ -300,6 +332,7 @@ impl Timetable {
                                 service_id: trip.service_id.clone(),
                                 arrivals: arrivals.iter().map(|&a| a + offset).collect(),
                                 departures: departures.iter().map(|&d| d + offset).collect(),
+                                wheelchair_accessible: trip.wheelchair_accessible,
                             });
                             dep += f.headway_secs as i32;
                         }
@@ -311,13 +344,18 @@ impl Timetable {
                         service_id: trip.service_id.clone(),
                         arrivals,
                         departures,
+                        wheelchair_accessible: trip.wheelchair_accessible,
                     });
                 }
             }
         }
 
         for pattern in &mut patterns {
-            pattern.trips.sort_by(|a, b| a.departures[0].cmp(&b.departures[0]).then_with(|| a.trip_id.0.cmp(&b.trip_id.0)));
+            pattern.trips.sort_by(|a, b| {
+                a.departures[0]
+                    .cmp(&b.departures[0])
+                    .then_with(|| a.trip_id.0.cmp(&b.trip_id.0))
+            });
         }
 
         // 6. stop_patterns 逆引き索引の構築。
@@ -332,7 +370,10 @@ impl Timetable {
         let mut calendars: HashMap<otp_core::ServiceId, ServiceCalendar> = HashMap::new();
         for feed in feeds {
             for cal in &feed.calendars {
-                calendars.entry(cal.service_id.clone()).or_default().weekdays = Some(cal.weekdays);
+                calendars
+                    .entry(cal.service_id.clone())
+                    .or_default()
+                    .weekdays = Some(cal.weekdays);
                 let entry = calendars.get_mut(&cal.service_id).unwrap();
                 entry.start_date = cal.start_date;
                 entry.end_date = cal.end_date;
@@ -377,24 +418,49 @@ impl Timetable {
                 if dist_m <= MAX_WALK_TRANSFER_M {
                     let walk_s = (dist_m / WALK_SPEED_MPS).ceil() as u32;
                     let duration_s = walk_s + DEFAULT_TRANSFER_BUFFER_S;
-                    transfers[i].push(Transfer { to_stop: j as StopIdx, duration_s });
-                    transfers[j].push(Transfer { to_stop: i as StopIdx, duration_s });
+                    transfers[i].push(Transfer {
+                        to_stop: j as StopIdx,
+                        duration_s,
+                    });
+                    transfers[j].push(Transfer {
+                        to_stop: i as StopIdx,
+                        duration_s,
+                    });
                 }
             }
         }
 
-        let stop_zones: Vec<Option<String>> = stop_ids.iter().map(|id| zone_of.get(id).cloned()).collect();
+        let stop_zones: Vec<Option<String>> =
+            stop_ids.iter().map(|id| zone_of.get(id).cloned()).collect();
         let stop_names: Vec<String> = stop_ids
             .iter()
-            .map(|id| name_of.get(id).cloned().unwrap_or_else(|| id.as_str().to_string()))
+            .map(|id| {
+                name_of
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| id.as_str().to_string())
+            })
             .collect();
 
-        Ok(Timetable { stop_ids, stop_names, stop_lookup, patterns, stop_patterns, transfers, calendars, stop_coords, stop_zones })
+        Ok(Timetable {
+            stop_ids,
+            stop_names,
+            stop_lookup,
+            patterns,
+            stop_patterns,
+            transfers,
+            calendars,
+            stop_coords,
+            stop_zones,
+        })
     }
 
     /// StopIdx → 停留所名。名前が無ければ StopId を返す (フォールバック)。
     pub fn stop_name(&self, stop: StopIdx) -> &str {
-        self.stop_names.get(stop as usize).map(String::as_str).unwrap_or("")
+        self.stop_names
+            .get(stop as usize)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     /// GTFS 生 stop_id (プラットフォーム含む) または正規化済み StopId から StopIdx を引く。
@@ -433,7 +499,9 @@ impl Timetable {
     }
 
     fn service_active(&self, service_id: &otp_core::ServiceId, date: u32) -> bool {
-        let Some(cal) = self.calendars.get(service_id) else { return false };
+        let Some(cal) = self.calendars.get(service_id) else {
+            return false;
+        };
         if cal.removed_dates.contains(&date) {
             return false;
         }
@@ -505,12 +573,22 @@ pub struct RaptorQuery {
     /// `Journey`/`JourneyLeg` 型なので下流 (`journey_to_itinerary`) は無改修。既存呼び出しは
     /// `false` で従来動作 (バイト単位で不変)。
     pub arrive_by: bool,
+    /// バリアフリー乗車を要求するフラグ (車いす/ベビーカー)。`true` のとき、
+    /// `trips.wheelchair_accessible` が明示的に `NotAccessible` (=2) の便には乗車しない
+    /// (前方・後方探索とも `earliest_catchable_trip`/`latest_alightable_trip` で除外)。
+    /// `Unknown` (空欄) の便は従来どおり許す (OTP の unknownCost 相当。実測: 東京の多くの
+    /// フィードは値が空なので、欠損を理由に候補を消しすぎない)。既存呼び出しは `false` で
+    /// 従来動作 (フィルタ無し = バイト単位で不変)。
+    pub require_wheelchair: bool,
 }
 
 /// 探索結果の1区間。
 #[derive(Debug, Clone)]
 pub enum JourneyLeg {
-    Walk { stop: StopIdx, duration_s: u32 },
+    Walk {
+        stop: StopIdx,
+        duration_s: u32,
+    },
     Transit {
         route_id: RouteId,
         route_short_name: String,
@@ -522,6 +600,10 @@ pub enum JourneyLeg {
         to: StopIdx,
         board_s: SecondsSinceMidnight,
         alight_s: SecondsSinceMidnight,
+        /// 乗車停留所と降車停留所の **間** (両端を除く) を実際に通過する停留所と、
+        /// その停留所へのトリップ到着時刻の対。急行等は実トリップの停車列を使うため、
+        /// 通過駅は列挙されない (存在しない停車を合成しない)。
+        intermediate: Vec<(StopIdx, SecondsSinceMidnight)>,
     },
 }
 
@@ -550,7 +632,14 @@ enum Parent {
     /// パターン `pattern` の便に `board_stop` (パターン内位置 `board_pos`) で乗車し、
     /// `alight_pos` で降りた。乗車時に参照した「1ラウンド前のラベル」が属していたラウンドを
     /// `prev_round` に保持し、遡上時にどのラウンドを見ればよいか自己完結させる。
-    Board { pattern: PatternIdx, trip_idx: usize, board_stop: StopIdx, board_pos: usize, alight_pos: usize, prev_round: usize },
+    Board {
+        pattern: PatternIdx,
+        trip_idx: usize,
+        board_stop: StopIdx,
+        board_pos: usize,
+        alight_pos: usize,
+        prev_round: usize,
+    },
     /// 乗換エッジ (`Timetable::transfers`, 近接駅の徒歩乗換) を辿って `from_stop` から
     /// 同一ラウンド内で到達した。同一ラウンド内の遷移なので `prev_round` は持たない
     /// (遡上時は `cur_round` を変えずに `from_stop` へ移る)。
@@ -574,18 +663,32 @@ impl Timetable {
         let n = self.stop_ids.len();
         let mut rounds: Vec<Vec<Label>> = Vec::with_capacity(query.max_rounds as usize + 1);
 
-        let mut round0 = vec![Label { arrival: INF, parent: None }; n];
+        let mut round0 = vec![
+            Label {
+                arrival: INF,
+                parent: None
+            };
+            n
+        ];
         for link in &query.access {
             let t = query.earliest_departure as i64 + link.duration_s as i64;
             let slot = &mut round0[link.stop as usize];
             if t < slot.arrival {
-                *slot = Label { arrival: t, parent: Some(Parent::Access) };
+                *slot = Label {
+                    arrival: t,
+                    parent: Some(Parent::Access),
+                };
             }
         }
         rounds.push(round0);
 
         let mut best: Vec<i64> = rounds[0].iter().map(|l| l.arrival).collect();
-        let mut marked: Vec<StopIdx> = query.access.iter().map(|l| l.stop).filter(|&s| (s as usize) < n).collect();
+        let mut marked: Vec<StopIdx> = query
+            .access
+            .iter()
+            .map(|l| l.stop)
+            .filter(|&s| (s as usize) < n)
+            .collect();
         marked.sort_unstable();
         marked.dedup();
 
@@ -611,7 +714,11 @@ impl Timetable {
                 if query.rail_only && !pattern.route_type.is_rail() {
                     continue;
                 }
-                let Some(start_pos) = pattern.stops.iter().position(|s| marked.binary_search(s).is_ok()) else {
+                let Some(start_pos) = pattern
+                    .stops
+                    .iter()
+                    .position(|s| marked.binary_search(s).is_ok())
+                else {
                     continue;
                 };
 
@@ -650,10 +757,20 @@ impl Timetable {
                                 Some(Parent::Board { .. }) => DEFAULT_TRANSFER_BUFFER_S as i64,
                                 _ => 0,
                             };
-                        if let Some(candidate) = earliest_catchable_trip(pattern, pos, boarding_ready, query.service_date, self) {
+                        if let Some(candidate) = earliest_catchable_trip(
+                            pattern,
+                            pos,
+                            boarding_ready,
+                            query.service_date,
+                            query.require_wheelchair,
+                            self,
+                        ) {
                             let is_better = match boarded {
                                 None => true,
-                                Some((cur_trip, _)) => pattern.trips[candidate].departures[pos] < pattern.trips[cur_trip].departures[pos],
+                                Some((cur_trip, _)) => {
+                                    pattern.trips[candidate].departures[pos]
+                                        < pattern.trips[cur_trip].departures[pos]
+                                }
                             };
                             if is_better {
                                 boarded = Some((candidate, pos));
@@ -685,7 +802,13 @@ impl Timetable {
                     let target = tr.to_stop as usize;
                     let candidate = arrival_at_s + tr.duration_s as i64;
                     if candidate < best[target] && candidate < cur[target].arrival {
-                        cur[target] = Label { arrival: candidate, parent: Some(Parent::Transfer { from_stop: s, duration_s: tr.duration_s }) };
+                        cur[target] = Label {
+                            arrival: candidate,
+                            parent: Some(Parent::Transfer {
+                                from_stop: s,
+                                duration_s: tr.duration_s,
+                            }),
+                        };
                         transfer_marked.push(tr.to_stop);
                     }
                 }
@@ -711,7 +834,9 @@ impl Timetable {
         for (k, round) in rounds.iter().enumerate() {
             let mut best_egress: Option<(StopIdx, i64, u32)> = None;
             for link in &query.egress {
-                let Some(label) = round.get(link.stop as usize) else { continue };
+                let Some(label) = round.get(link.stop as usize) else {
+                    continue;
+                };
                 if label.arrival == INF {
                     continue;
                 }
@@ -724,7 +849,10 @@ impl Timetable {
                 if total < best_so_far {
                     best_so_far = total;
                     let legs = self.reconstruct(&rounds, k, stop, egress_duration, query);
-                    let transit_legs = legs.iter().filter(|l| matches!(l, JourneyLeg::Transit { .. })).count();
+                    let transit_legs = legs
+                        .iter()
+                        .filter(|l| matches!(l, JourneyLeg::Transit { .. }))
+                        .count();
                     journeys.push(Journey {
                         legs,
                         arrival_s: total as SecondsSinceMidnight,
@@ -737,10 +865,20 @@ impl Timetable {
         Ok(journeys)
     }
 
-    fn reconstruct(&self, rounds: &[Vec<Label>], round: usize, egress_stop: StopIdx, egress_duration: u32, query: &RaptorQuery) -> Vec<JourneyLeg> {
+    fn reconstruct(
+        &self,
+        rounds: &[Vec<Label>],
+        round: usize,
+        egress_stop: StopIdx,
+        egress_duration: u32,
+        query: &RaptorQuery,
+    ) -> Vec<JourneyLeg> {
         let mut legs_rev: Vec<JourneyLeg> = Vec::new();
         if egress_duration > 0 {
-            legs_rev.push(JourneyLeg::Walk { stop: egress_stop, duration_s: egress_duration });
+            legs_rev.push(JourneyLeg::Walk {
+                stop: egress_stop,
+                duration_s: egress_duration,
+            });
         }
 
         let mut cur_round = round;
@@ -748,7 +886,14 @@ impl Timetable {
         loop {
             let label = rounds[cur_round][cur_stop as usize];
             match label.parent {
-                Some(Parent::Board { pattern, trip_idx, board_stop, board_pos, alight_pos, prev_round }) => {
+                Some(Parent::Board {
+                    pattern,
+                    trip_idx,
+                    board_stop,
+                    board_pos,
+                    alight_pos,
+                    prev_round,
+                }) => {
                     let pat = &self.patterns[pattern as usize];
                     let trip = &pat.trips[trip_idx];
                     legs_rev.push(JourneyLeg::Transit {
@@ -762,13 +907,22 @@ impl Timetable {
                         to: cur_stop,
                         board_s: trip.departures[board_pos],
                         alight_s: trip.arrivals[alight_pos],
+                        intermediate: ((board_pos + 1)..alight_pos)
+                            .map(|pos| (pat.stops[pos], trip.arrivals[pos]))
+                            .collect(),
                     });
                     cur_stop = board_stop;
                     cur_round = prev_round;
                 }
-                Some(Parent::Transfer { from_stop, duration_s }) => {
+                Some(Parent::Transfer {
+                    from_stop,
+                    duration_s,
+                }) => {
                     if duration_s > 0 {
-                        legs_rev.push(JourneyLeg::Walk { stop: cur_stop, duration_s });
+                        legs_rev.push(JourneyLeg::Walk {
+                            stop: cur_stop,
+                            duration_s,
+                        });
                     }
                     cur_stop = from_stop;
                     // 乗換エッジは同一ラウンド内の遷移: cur_round は変えない。
@@ -776,7 +930,10 @@ impl Timetable {
                 Some(Parent::Access) => {
                     if let Some(link) = query.access.iter().find(|l| l.stop == cur_stop) {
                         if link.duration_s > 0 {
-                            legs_rev.push(JourneyLeg::Walk { stop: cur_stop, duration_s: link.duration_s });
+                            legs_rev.push(JourneyLeg::Walk {
+                                stop: cur_stop,
+                                duration_s: link.duration_s,
+                            });
                         }
                     }
                     break;
@@ -813,18 +970,32 @@ impl Timetable {
 
         // 0ラウンド目: egress 停留所に「T − egress 徒歩」を張る (この時刻までにその駅に
         // いれば徒歩で締切内に目的地へ着ける)。最大化なので大きい方を採用する。
-        let mut round0 = vec![Label { arrival: NEG, parent: None }; n];
+        let mut round0 = vec![
+            Label {
+                arrival: NEG,
+                parent: None
+            };
+            n
+        ];
         for link in &query.egress {
             let t = deadline - link.duration_s as i64;
             let slot = &mut round0[link.stop as usize];
             if t > slot.arrival {
-                *slot = Label { arrival: t, parent: Some(Parent::Egress) };
+                *slot = Label {
+                    arrival: t,
+                    parent: Some(Parent::Egress),
+                };
             }
         }
         rounds.push(round0);
 
         let mut best: Vec<i64> = rounds[0].iter().map(|l| l.arrival).collect();
-        let mut marked: Vec<StopIdx> = query.egress.iter().map(|l| l.stop).filter(|&s| (s as usize) < n).collect();
+        let mut marked: Vec<StopIdx> = query
+            .egress
+            .iter()
+            .map(|l| l.stop)
+            .filter(|&s| (s as usize) < n)
+            .collect();
         marked.sort_unstable();
         marked.dedup();
 
@@ -851,7 +1022,11 @@ impl Timetable {
                 // 後方走査の起点は marked のうち最も後方 (dest 寄り) の位置。そこから前方へ
                 // 「降車→前方停留所の乗車時刻を伝播」する (前方探索が最初の marked から
                 // 後方へ走るのと対称)。
-                let Some(end_pos) = pattern.stops.iter().rposition(|s| marked.binary_search(s).is_ok()) else {
+                let Some(end_pos) = pattern
+                    .stops
+                    .iter()
+                    .rposition(|s| marked.binary_search(s).is_ok())
+                else {
                     continue;
                 };
 
@@ -892,10 +1067,20 @@ impl Timetable {
                                 Some(Parent::Board { .. }) => DEFAULT_TRANSFER_BUFFER_S as i64,
                                 _ => 0,
                             };
-                        if let Some(candidate) = latest_alightable_trip(pattern, pos, alight_ready, query.service_date, self) {
+                        if let Some(candidate) = latest_alightable_trip(
+                            pattern,
+                            pos,
+                            alight_ready,
+                            query.service_date,
+                            query.require_wheelchair,
+                            self,
+                        ) {
                             let is_better = match boarded {
                                 None => true,
-                                Some((cur_trip, _)) => pattern.trips[candidate].arrivals[pos] > pattern.trips[cur_trip].arrivals[pos],
+                                Some((cur_trip, _)) => {
+                                    pattern.trips[candidate].arrivals[pos]
+                                        > pattern.trips[cur_trip].arrivals[pos]
+                                }
                             };
                             if is_better {
                                 boarded = Some((candidate, pos));
@@ -929,7 +1114,13 @@ impl Timetable {
                         // `from_stop` フィールドには「dest 寄り (この徒歩の到達側 = s)」を格納する。
                         // 前方探索では from_stop に「発地側」を入れるが、逆探索の遡上は dest 側へ
                         // 進むため、reconstruct_arrive_by 側でこの向きに読み替える。
-                        cur[target] = Label { arrival: candidate, parent: Some(Parent::Transfer { from_stop: s, duration_s: tr.duration_s }) };
+                        cur[target] = Label {
+                            arrival: candidate,
+                            parent: Some(Parent::Transfer {
+                                from_stop: s,
+                                duration_s: tr.duration_s,
+                            }),
+                        };
                         transfer_marked.push(tr.to_stop);
                     }
                 }
@@ -957,7 +1148,9 @@ impl Timetable {
         for (k, round) in rounds.iter().enumerate() {
             let mut best_access: Option<(StopIdx, i64, u32)> = None; // (stop, 出発地出発時刻, access徒歩)
             for link in &query.access {
-                let Some(label) = round.get(link.stop as usize) else { continue };
+                let Some(label) = round.get(link.stop as usize) else {
+                    continue;
+                };
                 if label.arrival == NEG {
                     continue;
                 }
@@ -969,8 +1162,18 @@ impl Timetable {
             if let Some((stop, depart_origin, access_duration)) = best_access {
                 if depart_origin > best_departure {
                     best_departure = depart_origin;
-                    let (legs, arrival) = self.reconstruct_arrive_by(&rounds, k, stop, access_duration, deadline, query);
-                    let transit_legs = legs.iter().filter(|l| matches!(l, JourneyLeg::Transit { .. })).count();
+                    let (legs, arrival) = self.reconstruct_arrive_by(
+                        &rounds,
+                        k,
+                        stop,
+                        access_duration,
+                        deadline,
+                        query,
+                    );
+                    let transit_legs = legs
+                        .iter()
+                        .filter(|l| matches!(l, JourneyLeg::Transit { .. }))
+                        .count();
                     journeys.push(Journey {
                         legs,
                         arrival_s: arrival as SecondsSinceMidnight,
@@ -988,11 +1191,22 @@ impl Timetable {
     /// reverse は不要: 逆探索の遡上方向がそのまま前方順になる)。戻り値は (leg 列, 目的地への
     /// 実到着時刻)。実到着 = 末尾 Transit の alight + それ以降の徒歩 (footpath + egress) 合計で、
     /// 構成上 `deadline` 以下になる。
-    fn reconstruct_arrive_by(&self, rounds: &[Vec<Label>], round: usize, access_stop: StopIdx, access_duration: u32, deadline: i64, query: &RaptorQuery) -> (Vec<JourneyLeg>, i64) {
+    fn reconstruct_arrive_by(
+        &self,
+        rounds: &[Vec<Label>],
+        round: usize,
+        access_stop: StopIdx,
+        access_duration: u32,
+        deadline: i64,
+        query: &RaptorQuery,
+    ) -> (Vec<JourneyLeg>, i64) {
         let mut legs: Vec<JourneyLeg> = Vec::new();
         // 先頭: 出発地 → access 停留所の徒歩。
         if access_duration > 0 {
-            legs.push(JourneyLeg::Walk { stop: access_stop, duration_s: access_duration });
+            legs.push(JourneyLeg::Walk {
+                stop: access_stop,
+                duration_s: access_duration,
+            });
         }
 
         let mut cur_round = round;
@@ -1000,7 +1214,14 @@ impl Timetable {
         loop {
             let label = rounds[cur_round][cur_stop as usize];
             match label.parent {
-                Some(Parent::Board { pattern, trip_idx, board_pos, alight_pos, prev_round, .. }) => {
+                Some(Parent::Board {
+                    pattern,
+                    trip_idx,
+                    board_pos,
+                    alight_pos,
+                    prev_round,
+                    ..
+                }) => {
                     let pat = &self.patterns[pattern as usize];
                     let trip = &pat.trips[trip_idx];
                     let alight_stop = pat.stops[alight_pos];
@@ -1015,15 +1236,24 @@ impl Timetable {
                         to: alight_stop,
                         board_s: trip.departures[board_pos],
                         alight_s: trip.arrivals[alight_pos],
+                        intermediate: ((board_pos + 1)..alight_pos)
+                            .map(|pos| (pat.stops[pos], trip.arrivals[pos]))
+                            .collect(),
                     });
                     cur_stop = alight_stop;
                     cur_round = prev_round;
                 }
-                Some(Parent::Transfer { from_stop, duration_s }) => {
+                Some(Parent::Transfer {
+                    from_stop,
+                    duration_s,
+                }) => {
                     // 逆探索では from_stop に dest 寄り (徒歩の到達側) を格納している。
                     // 前方順ではこの徒歩は cur_stop → from_stop なので、to 側 = from_stop。
                     if duration_s > 0 {
-                        legs.push(JourneyLeg::Walk { stop: from_stop, duration_s });
+                        legs.push(JourneyLeg::Walk {
+                            stop: from_stop,
+                            duration_s,
+                        });
                     }
                     cur_stop = from_stop;
                     // 乗換エッジは同一ラウンド内の遷移: cur_round は変えない。
@@ -1031,7 +1261,10 @@ impl Timetable {
                 Some(Parent::Egress) => {
                     if let Some(link) = query.egress.iter().find(|l| l.stop == cur_stop) {
                         if link.duration_s > 0 {
-                            legs.push(JourneyLeg::Walk { stop: cur_stop, duration_s: link.duration_s });
+                            legs.push(JourneyLeg::Walk {
+                                stop: cur_stop,
+                                duration_s: link.duration_s,
+                            });
                         }
                     }
                     break;
@@ -1042,7 +1275,10 @@ impl Timetable {
 
         // 実到着時刻 = 末尾 Transit の alight + それ以降の徒歩 (footpath + egress) 合計。
         let mut arrival = deadline;
-        if let Some(last_transit) = legs.iter().rposition(|l| matches!(l, JourneyLeg::Transit { .. })) {
+        if let Some(last_transit) = legs
+            .iter()
+            .rposition(|l| matches!(l, JourneyLeg::Transit { .. }))
+        {
             if let JourneyLeg::Transit { alight_s, .. } = &legs[last_transit] {
                 let trailing_walk: i64 = legs[last_transit + 1..]
                     .iter()
@@ -1060,11 +1296,27 @@ impl Timetable {
 
 /// パターン内位置 `pos` において、`not_before` 以降に出発し、かつ `date` に運行している
 /// 最も早い便を探す (パターン内の便は始発出発時刻昇順 = 追い越し無し前提で各位置でも昇順)。
-fn earliest_catchable_trip(pattern: &Pattern, pos: usize, not_before: i64, date: u32, tt: &Timetable) -> Option<usize> {
-    pattern
-        .trips
-        .iter()
-        .position(|t| t.departures[pos] as i64 >= not_before && tt.service_active(&t.service_id, date))
+/// `require_wheelchair` が真なら、明示的に `NotAccessible` の便は除外する。
+fn earliest_catchable_trip(
+    pattern: &Pattern,
+    pos: usize,
+    not_before: i64,
+    date: u32,
+    require_wheelchair: bool,
+    tt: &Timetable,
+) -> Option<usize> {
+    pattern.trips.iter().position(|t| {
+        t.departures[pos] as i64 >= not_before
+            && tt.service_active(&t.service_id, date)
+            && trip_wheelchair_ok(t, require_wheelchair)
+    })
+}
+
+/// `require_wheelchair` 下でこの便に乗ってよいか。明示的に `NotAccessible` の便のみ弾く
+/// (`Unknown`/`Accessible` は許可)。
+fn trip_wheelchair_ok(trip: &PatternTrip, require_wheelchair: bool) -> bool {
+    !(require_wheelchair
+        && trip.wheelchair_accessible == otp_gtfs::WheelchairBoarding::NotAccessible)
 }
 
 /// [`earliest_catchable_trip`] の arrive-by 版。パターン内位置 `pos` において、
@@ -1072,11 +1324,19 @@ fn earliest_catchable_trip(pattern: &Pattern, pos: usize, not_before: i64, date:
 /// (便は始発出発昇順 = 追い越し無し前提で各位置の到着も昇順なので、後ろから最初に
 /// 条件を満たす便 = 到着が最も遅い便を `rposition` で拾う)。到着を最遅にすることで、
 /// その便が前方停留所を出発する時刻 (=最遅在線時刻) も最大化される。
-fn latest_alightable_trip(pattern: &Pattern, pos: usize, not_after: i64, date: u32, tt: &Timetable) -> Option<usize> {
-    pattern
-        .trips
-        .iter()
-        .rposition(|t| t.arrivals[pos] as i64 <= not_after && tt.service_active(&t.service_id, date))
+fn latest_alightable_trip(
+    pattern: &Pattern,
+    pos: usize,
+    not_after: i64,
+    date: u32,
+    require_wheelchair: bool,
+    tt: &Timetable,
+) -> Option<usize> {
+    pattern.trips.iter().rposition(|t| {
+        t.arrivals[pos] as i64 <= not_after
+            && tt.service_active(&t.service_id, date)
+            && trip_wheelchair_ok(t, require_wheelchair)
+    })
 }
 
 #[cfg(test)]
@@ -1084,7 +1344,10 @@ mod tests {
     use super::*;
 
     fn fixture_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../gtfs/tests/fixtures/mini"))
+        std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../gtfs/tests/fixtures/mini"
+        ))
     }
 
     fn load() -> Timetable {
@@ -1101,19 +1364,51 @@ mod tests {
         // という単純化 (struct doc 参照) を明示的に検証する。
         let feed = Feed {
             stops: vec![
-                Stop { id: StopId::new("A"), name: "A".into(), lat: 35.0, lng: 139.0, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
-                Stop { id: StopId::new("C1"), name: "C1".into(), lat: 35.1, lng: 139.1, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: Some(StopId::new("C")), zone_id: Some("900".into()) },
-                Stop { id: StopId::new("C2"), name: "C2".into(), lat: 35.1, lng: 139.1, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: Some(StopId::new("C")), zone_id: Some("901".into()) },
+                Stop {
+                    id: StopId::new("A"),
+                    name: "A".into(),
+                    lat: 35.0,
+                    lng: 139.0,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+                Stop {
+                    id: StopId::new("C1"),
+                    name: "C1".into(),
+                    lat: 35.1,
+                    lng: 139.1,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: Some(StopId::new("C")),
+                    zone_id: Some("900".into()),
+                },
+                Stop {
+                    id: StopId::new("C2"),
+                    name: "C2".into(),
+                    lat: 35.1,
+                    lng: 139.1,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: Some(StopId::new("C")),
+                    zone_id: Some("901".into()),
+                },
             ],
             ..Feed::default()
         };
         let tt = Timetable::build(&[feed]).expect("timetable should build");
 
-        let a = tt.stop_idx(&StopId::new("A")).expect("A should be registered");
+        let a = tt
+            .stop_idx(&StopId::new("A"))
+            .expect("A should be registered");
         assert_eq!(tt.stop_zone(a), None, "zone_idが無い駅はNone");
 
-        let c = tt.stop_idx(&StopId::new("C")).expect("C (canonical) should be registered");
-        assert_eq!(tt.stop_zone(c), Some("900"), "C1(900)が先に見つかるのでC1のzoneを採用");
+        let c = tt
+            .stop_idx(&StopId::new("C"))
+            .expect("C (canonical) should be registered");
+        assert_eq!(
+            tt.stop_zone(c),
+            Some("900"),
+            "C1(900)が先に見つかるのでC1のzoneを採用"
+        );
     }
 
     #[test]
@@ -1127,22 +1422,75 @@ mod tests {
 
     #[test]
     fn build_expands_frequency_trips_into_headway_spaced_departures() {
-        use otp_gtfs::{Calendar, Frequency, Route, RouteType, Stop, StopTime, Trip, WheelchairBoarding};
+        use otp_gtfs::{
+            Calendar, Frequency, Route, RouteType, Stop, StopTime, Trip, WheelchairBoarding,
+        };
         // 雛形 trip T1 (A発0秒→B着300秒) を frequencies で 08:00-09:00 の10分間隔運行にする。
         // (32400-28800)/600 = 6本に展開され、各先頭発は 28800,29400,...,31800 になるはず。
         let feed = Feed {
             stops: vec![
-                Stop { id: StopId::new("A"), name: "A".into(), lat: 35.0, lng: 139.0, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
-                Stop { id: StopId::new("B"), name: "B".into(), lat: 35.01, lng: 139.01, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+                Stop {
+                    id: StopId::new("A"),
+                    name: "A".into(),
+                    lat: 35.0,
+                    lng: 139.0,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+                Stop {
+                    id: StopId::new("B"),
+                    name: "B".into(),
+                    lat: 35.01,
+                    lng: 139.01,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
             ],
-            routes: vec![Route { id: RouteId::new("R1"), agency_id: None, short_name: "R1".into(), long_name: "R1".into(), route_type: RouteType::Rail }],
-            trips: vec![Trip { id: TripId::new("T1"), route_id: RouteId::new("R1"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown }],
+            routes: vec![Route {
+                id: RouteId::new("R1"),
+                agency_id: None,
+                short_name: "R1".into(),
+                long_name: "R1".into(),
+                route_type: RouteType::Rail,
+            }],
+            trips: vec![Trip {
+                id: TripId::new("T1"),
+                route_id: RouteId::new("R1"),
+                service_id: otp_core::ServiceId::new("WD"),
+                headsign: None,
+                wheelchair_accessible: WheelchairBoarding::Unknown,
+            }],
             stop_times: vec![
-                StopTime { trip_id: TripId::new("T1"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 0, departure: 0 },
-                StopTime { trip_id: TripId::new("T1"), stop_id: StopId::new("B"), stop_sequence: 2, arrival: 300, departure: 300 },
+                StopTime {
+                    trip_id: TripId::new("T1"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 0,
+                    departure: 0,
+                },
+                StopTime {
+                    trip_id: TripId::new("T1"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 300,
+                    departure: 300,
+                },
             ],
-            calendars: vec![Calendar { service_id: otp_core::ServiceId::new("WD"), weekdays: [true, true, true, true, true, false, false], start_date: 20260101, end_date: 20301231 }],
-            frequencies: vec![Frequency { trip_id: TripId::new("T1"), start_time: 28800, end_time: 32400, headway_secs: 600, exact_times: 0 }],
+            calendars: vec![Calendar {
+                service_id: otp_core::ServiceId::new("WD"),
+                weekdays: [true, true, true, true, true, false, false],
+                start_date: 20260101,
+                end_date: 20301231,
+            }],
+            frequencies: vec![Frequency {
+                trip_id: TripId::new("T1"),
+                start_time: 28800,
+                end_time: 32400,
+                headway_secs: 600,
+                exact_times: 0,
+            }],
             ..Feed::default()
         };
         let tt = Timetable::build(&[feed]).expect("timetable should build");
@@ -1161,7 +1509,11 @@ mod tests {
         let tt = load();
         // R3 (bus, route_type=3) の停留所列を含むパターンは無いはず。
         for pattern in &tt.patterns {
-            assert_ne!(pattern.route_id.as_str(), "R3", "bus route must be excluded from rail-only timetable");
+            assert_ne!(
+                pattern.route_id.as_str(),
+                "R3",
+                "bus route must be excluded from rail-only timetable"
+            );
         }
     }
 
@@ -1184,7 +1536,7 @@ mod tests {
         assert!(tt.service_active(&wd, 20260713));
         assert!(!tt.service_active(&wd, 20260720));
         assert!(!tt.service_active(&wd, 20260714)); // 火曜なので運行なし
-        // WD_EXTRA: calendar.txt に無く、calendar_datesの追加でのみ2026-07-13が運行。
+                                                    // WD_EXTRA: calendar.txt に無く、calendar_datesの追加でのみ2026-07-13が運行。
         assert!(tt.service_active(&wd_extra, 20260713));
         assert!(!tt.service_active(&wd_extra, 20260714));
     }
@@ -1196,13 +1548,20 @@ mod tests {
         let d = tt.stop_idx(&StopId::new("D")).unwrap();
 
         let query = RaptorQuery {
-            access: vec![StreetLink { stop: a, duration_s: 0 }],
-            egress: vec![StreetLink { stop: d, duration_s: 0 }],
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: d,
+                duration_s: 0,
+            }],
             earliest_departure: 8 * 3600, // 08:00:00
             service_date: 20260713,       // 月曜 (WD, WD_EXTRA とも運行)
             max_rounds: 2,
             rail_only: false,
             arrive_by: false,
+            require_wheelchair: false,
         };
 
         let journeys = tt.search(&query).expect("search should not error");
@@ -1211,20 +1570,98 @@ mod tests {
         let best = journeys.last().unwrap();
         // 手計算: A(08:00)→B(08:05)→C1(08:10) [T1] → 乗換 → C2(08:20)→D(08:30) [T2]
         // R3 (バス, A→D 08:00→08:05) は鉄道フィルタで除外されるため選ばれない。
-        assert_eq!(best.arrival_s, 8 * 3600 + 30 * 60, "expected arrival 08:30:00, got {}", best.arrival_s);
+        assert_eq!(
+            best.arrival_s,
+            8 * 3600 + 30 * 60,
+            "expected arrival 08:30:00, got {}",
+            best.arrival_s
+        );
         assert_eq!(best.transfers, 1);
 
         let transit_legs: Vec<_> = best
             .legs
             .iter()
             .filter_map(|l| match l {
-                JourneyLeg::Transit { trip_id, board_s, alight_s, .. } => Some((trip_id.as_str().to_string(), *board_s, *alight_s)),
+                JourneyLeg::Transit {
+                    trip_id,
+                    board_s,
+                    alight_s,
+                    ..
+                } => Some((trip_id.as_str().to_string(), *board_s, *alight_s)),
                 _ => None,
             })
             .collect();
         assert_eq!(transit_legs.len(), 2);
-        assert_eq!(transit_legs[0], ("T1".to_string(), 8 * 3600, 8 * 3600 + 600));
-        assert_eq!(transit_legs[1], ("T2".to_string(), 8 * 3600 + 1200, 8 * 3600 + 1800));
+        assert_eq!(
+            transit_legs[0],
+            ("T1".to_string(), 8 * 3600, 8 * 3600 + 600)
+        );
+        assert_eq!(
+            transit_legs[1],
+            ("T2".to_string(), 8 * 3600 + 1200, 8 * 3600 + 1800)
+        );
+    }
+
+    #[test]
+    fn transit_leg_lists_intermediate_stops_between_board_and_alight() {
+        let tt = load();
+        let a = tt.stop_idx(&StopId::new("A")).unwrap();
+        let d = tt.stop_idx(&StopId::new("D")).unwrap();
+        let b = tt.stop_idx(&StopId::new("B")).unwrap();
+
+        let query = RaptorQuery {
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: d,
+                duration_s: 0,
+            }],
+            earliest_departure: 8 * 3600,
+            service_date: 20260713,
+            max_rounds: 2,
+            rail_only: false,
+            arrive_by: false,
+            require_wheelchair: false,
+        };
+        let journeys = tt.search(&query).expect("search should not error");
+        let best = journeys.last().unwrap();
+
+        // 先頭の Transit は T1: A(08:00)→B(08:05)→C1(08:10)。
+        // 乗車 A・降車 C1 の間の B が唯一の中間駅で、到着時刻は 08:05 のはず。
+        let first_transit = best
+            .legs
+            .iter()
+            .find_map(|l| match l {
+                JourneyLeg::Transit {
+                    trip_id,
+                    intermediate,
+                    ..
+                } if trip_id.as_str() == "T1" => Some(intermediate.clone()),
+                _ => None,
+            })
+            .expect("T1 Transit leg should exist");
+        assert_eq!(
+            first_transit,
+            vec![(b, 8 * 3600 + 300)],
+            "B (08:05) が唯一の中間駅のはず"
+        );
+
+        // 2本目 T2 は C2→D の直行 (中間駅なし)。
+        let second_transit = best
+            .legs
+            .iter()
+            .find_map(|l| match l {
+                JourneyLeg::Transit {
+                    trip_id,
+                    intermediate,
+                    ..
+                } if trip_id.as_str() == "T2" => Some(intermediate.clone()),
+                _ => None,
+            })
+            .expect("T2 Transit leg should exist");
+        assert!(second_transit.is_empty(), "C2→D 直行は中間駅なしのはず");
     }
 
     #[test]
@@ -1234,8 +1671,15 @@ mod tests {
         let a_coord = tt.stop_coord(tt.stop_idx(&StopId::new("A")).unwrap());
         let found = tt.nearby_stops(a_coord, 2000.0);
 
-        let ids: Vec<&str> = found.iter().map(|(idx, _)| tt.stop_ids[*idx as usize].as_str()).collect();
-        assert_eq!(ids, vec!["A", "B"], "2km以内はA自身とBのみのはず (C以遠は除外)");
+        let ids: Vec<&str> = found
+            .iter()
+            .map(|(idx, _)| tt.stop_ids[*idx as usize].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["A", "B"],
+            "2km以内はA自身とBのみのはず (C以遠は除外)"
+        );
     }
 
     #[test]
@@ -1244,16 +1688,26 @@ mod tests {
         let a = tt.stop_idx(&StopId::new("A")).unwrap();
         let d = tt.stop_idx(&StopId::new("D")).unwrap();
         let query = RaptorQuery {
-            access: vec![StreetLink { stop: a, duration_s: 0 }],
-            egress: vec![StreetLink { stop: d, duration_s: 0 }],
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: d,
+                duration_s: 0,
+            }],
             earliest_departure: 8 * 3600,
             service_date: 20260714, // 火曜: WD (月曜のみ) も WD_EXTRA (calendar_datesは13日のみ) も運行なし
             max_rounds: 2,
             rail_only: false,
             arrive_by: false,
+            require_wheelchair: false,
         };
         let journeys = tt.search(&query).expect("search should not error");
-        assert!(journeys.is_empty(), "expected no journey when nothing is running, got {journeys:?}");
+        assert!(
+            journeys.is_empty(),
+            "expected no journey when nothing is running, got {journeys:?}"
+        );
     }
 
     /// A→B の1路線に3便 (08:00→08:30 / 08:20→08:50 / 08:40→09:10) を持つ手組みフィクスチャ。
@@ -1262,27 +1716,108 @@ mod tests {
         use otp_gtfs::{Calendar, Route, RouteType, Stop, StopTime, Trip, WheelchairBoarding};
         let feed = Feed {
             stops: vec![
-                Stop { id: StopId::new("A"), name: "A".into(), lat: 35.0, lng: 139.0, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
-                Stop { id: StopId::new("B"), name: "B".into(), lat: 35.2, lng: 139.2, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+                Stop {
+                    id: StopId::new("A"),
+                    name: "A".into(),
+                    lat: 35.0,
+                    lng: 139.0,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+                Stop {
+                    id: StopId::new("B"),
+                    name: "B".into(),
+                    lat: 35.2,
+                    lng: 139.2,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
             ],
-            routes: vec![Route { id: RouteId::new("R1"), agency_id: None, short_name: "R1".into(), long_name: "R1".into(), route_type: RouteType::Rail }],
+            routes: vec![Route {
+                id: RouteId::new("R1"),
+                agency_id: None,
+                short_name: "R1".into(),
+                long_name: "R1".into(),
+                route_type: RouteType::Rail,
+            }],
             trips: vec![
-                Trip { id: TripId::new("Tr1"), route_id: RouteId::new("R1"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown },
-                Trip { id: TripId::new("Tr2"), route_id: RouteId::new("R1"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown },
-                Trip { id: TripId::new("Tr3"), route_id: RouteId::new("R1"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown },
+                Trip {
+                    id: TripId::new("Tr1"),
+                    route_id: RouteId::new("R1"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::Unknown,
+                },
+                Trip {
+                    id: TripId::new("Tr2"),
+                    route_id: RouteId::new("R1"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::Unknown,
+                },
+                Trip {
+                    id: TripId::new("Tr3"),
+                    route_id: RouteId::new("R1"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::Unknown,
+                },
             ],
             stop_times: vec![
                 // Tr1: A 08:00 → B 08:30
-                StopTime { trip_id: TripId::new("Tr1"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 8 * 3600, departure: 8 * 3600 },
-                StopTime { trip_id: TripId::new("Tr1"), stop_id: StopId::new("B"), stop_sequence: 2, arrival: 8 * 3600 + 1800, departure: 8 * 3600 + 1800 },
+                StopTime {
+                    trip_id: TripId::new("Tr1"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600,
+                    departure: 8 * 3600,
+                },
+                StopTime {
+                    trip_id: TripId::new("Tr1"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 1800,
+                    departure: 8 * 3600 + 1800,
+                },
                 // Tr2: A 08:20 → B 08:50
-                StopTime { trip_id: TripId::new("Tr2"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 8 * 3600 + 1200, departure: 8 * 3600 + 1200 },
-                StopTime { trip_id: TripId::new("Tr2"), stop_id: StopId::new("B"), stop_sequence: 2, arrival: 8 * 3600 + 3000, departure: 8 * 3600 + 3000 },
+                StopTime {
+                    trip_id: TripId::new("Tr2"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600 + 1200,
+                    departure: 8 * 3600 + 1200,
+                },
+                StopTime {
+                    trip_id: TripId::new("Tr2"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 3000,
+                    departure: 8 * 3600 + 3000,
+                },
                 // Tr3: A 08:40 → B 09:10
-                StopTime { trip_id: TripId::new("Tr3"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 8 * 3600 + 2400, departure: 8 * 3600 + 2400 },
-                StopTime { trip_id: TripId::new("Tr3"), stop_id: StopId::new("B"), stop_sequence: 2, arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600 },
+                StopTime {
+                    trip_id: TripId::new("Tr3"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600 + 2400,
+                    departure: 8 * 3600 + 2400,
+                },
+                StopTime {
+                    trip_id: TripId::new("Tr3"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 9 * 3600 + 600,
+                    departure: 9 * 3600 + 600,
+                },
             ],
-            calendars: vec![Calendar { service_id: otp_core::ServiceId::new("WD"), weekdays: [true, true, true, true, true, false, false], start_date: 20260101, end_date: 20301231 }],
+            calendars: vec![Calendar {
+                service_id: otp_core::ServiceId::new("WD"),
+                weekdays: [true, true, true, true, true, false, false],
+                start_date: 20260101,
+                end_date: 20301231,
+            }],
             ..Feed::default()
         };
         Timetable::build(&[feed]).expect("timetable should build")
@@ -1297,31 +1832,51 @@ mod tests {
         // 締切 09:00。09:00 までに B へ着ける便は Tr1(08:30着)/Tr2(08:50着)。Tr3(09:10着)は不可。
         // arrive-by は「締切内で最も遅く出発」= Tr2 (08:20発→08:50着) を選ぶはず。
         let query = RaptorQuery {
-            access: vec![StreetLink { stop: a, duration_s: 0 }],
-            egress: vec![StreetLink { stop: b, duration_s: 0 }],
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: b,
+                duration_s: 0,
+            }],
             earliest_departure: 9 * 3600, // arrive-by では到着締切 T
             service_date: 20260713,
             max_rounds: 2,
             rail_only: false,
             arrive_by: true,
+            require_wheelchair: false,
         };
         let journeys = tt.search(&query).expect("search should not error");
         assert!(!journeys.is_empty(), "arrive-by で経路が見つからなかった");
         let best = journeys.last().unwrap();
 
         // 実到着は締切 09:00 以下。
-        assert!(best.arrival_s <= 9 * 3600, "到着 {} は締切 09:00 以下のはず", best.arrival_s);
+        assert!(
+            best.arrival_s <= 9 * 3600,
+            "到着 {} は締切 09:00 以下のはず",
+            best.arrival_s
+        );
         // 選ばれた便は Tr2: 08:20発 → 08:50着 (最遅出発)。
         let transit: Vec<_> = best
             .legs
             .iter()
             .filter_map(|l| match l {
-                JourneyLeg::Transit { trip_id, board_s, alight_s, .. } => Some((trip_id.as_str().to_string(), *board_s, *alight_s)),
+                JourneyLeg::Transit {
+                    trip_id,
+                    board_s,
+                    alight_s,
+                    ..
+                } => Some((trip_id.as_str().to_string(), *board_s, *alight_s)),
                 _ => None,
             })
             .collect();
         assert_eq!(transit.len(), 1, "1便のはず: {transit:?}");
-        assert_eq!(transit[0], ("Tr2".to_string(), 8 * 3600 + 1200, 8 * 3600 + 3000), "締切内で最遅出発の Tr2 が選ばれるはず");
+        assert_eq!(
+            transit[0],
+            ("Tr2".to_string(), 8 * 3600 + 1200, 8 * 3600 + 3000),
+            "締切内で最遅出発の Tr2 が選ばれるはず"
+        );
         assert_eq!(best.arrival_s, 8 * 3600 + 3000, "到着は 08:50");
     }
 
@@ -1334,13 +1889,20 @@ mod tests {
         // 同一フィクスチャで前方探索 (08:00発) は最早の Tr1 (08:00発→08:30着) を返す — arrive-by
         // の Tr2 とは別便を選ぶ。前方探索が arrive_by=false で従来どおり動くことの確認。
         let forward = RaptorQuery {
-            access: vec![StreetLink { stop: a, duration_s: 0 }],
-            egress: vec![StreetLink { stop: b, duration_s: 0 }],
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: b,
+                duration_s: 0,
+            }],
             earliest_departure: 8 * 3600,
             service_date: 20260713,
             max_rounds: 2,
             rail_only: false,
             arrive_by: false,
+            require_wheelchair: false,
         };
         let journeys = tt.search(&forward).expect("search should not error");
         let best = journeys.last().unwrap();
@@ -1348,11 +1910,20 @@ mod tests {
             .legs
             .iter()
             .filter_map(|l| match l {
-                JourneyLeg::Transit { trip_id, board_s, alight_s, .. } => Some((trip_id.as_str().to_string(), *board_s, *alight_s)),
+                JourneyLeg::Transit {
+                    trip_id,
+                    board_s,
+                    alight_s,
+                    ..
+                } => Some((trip_id.as_str().to_string(), *board_s, *alight_s)),
                 _ => None,
             })
             .collect();
-        assert_eq!(transit[0], ("Tr1".to_string(), 8 * 3600, 8 * 3600 + 1800), "前方探索は最早の Tr1 を選ぶはず");
+        assert_eq!(
+            transit[0],
+            ("Tr1".to_string(), 8 * 3600, 8 * 3600 + 1800),
+            "前方探索は最早の Tr1 を選ぶはず"
+        );
     }
 
     #[test]
@@ -1364,16 +1935,32 @@ mod tests {
         let a = tt.stop_idx(&StopId::new("A")).unwrap();
         let b = tt.stop_idx(&StopId::new("B")).unwrap();
         let query = RaptorQuery {
-            access: vec![StreetLink { stop: a, duration_s: 0 }],
-            egress: vec![StreetLink { stop: b, duration_s: 900 }],
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: b,
+                duration_s: 900,
+            }],
             earliest_departure: 9 * 3600,
             service_date: 20260713,
             max_rounds: 2,
             rail_only: false,
             arrive_by: true,
+            require_wheelchair: false,
         };
-        let best = tt.search(&query).expect("search should not error").into_iter().last().expect("経路が見つからなかった");
-        assert!(best.arrival_s <= 9 * 3600, "実到着 {} は締切以下", best.arrival_s);
+        let best = tt
+            .search(&query)
+            .expect("search should not error")
+            .into_iter()
+            .last()
+            .expect("経路が見つからなかった");
+        assert!(
+            best.arrival_s <= 9 * 3600,
+            "実到着 {} は締切以下",
+            best.arrival_s
+        );
         let trip = best
             .legs
             .iter()
@@ -1383,7 +1970,11 @@ mod tests {
             })
             .expect("Transit leg があるはず");
         assert_eq!(trip, "Tr1", "egress 徒歩15分ぶん早い Tr1 が選ばれるはず");
-        assert_eq!(best.arrival_s, 8 * 3600 + 1800 + 900, "実到着 = B着08:30 + 徒歩15分 = 08:45");
+        assert_eq!(
+            best.arrival_s,
+            8 * 3600 + 1800 + 900,
+            "実到着 = B着08:30 + 徒歩15分 = 08:45"
+        );
     }
 
     #[test]
@@ -1395,61 +1986,441 @@ mod tests {
         // スキップされ、遅い鉄道が返るはず (バス経路に負けても鉄道の代替を拾える)。
         let feed = Feed {
             stops: vec![
-                Stop { id: StopId::new("A"), name: "A".into(), lat: 35.0, lng: 139.0, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
-                Stop { id: StopId::new("D"), name: "D".into(), lat: 35.05, lng: 139.05, wheelchair_boarding: WheelchairBoarding::Unknown, parent_station: None, zone_id: None },
+                Stop {
+                    id: StopId::new("A"),
+                    name: "A".into(),
+                    lat: 35.0,
+                    lng: 139.0,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+                Stop {
+                    id: StopId::new("D"),
+                    name: "D".into(),
+                    lat: 35.05,
+                    lng: 139.05,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
             ],
             routes: vec![
-                Route { id: RouteId::new("RBUS"), agency_id: None, short_name: "急行バス".into(), long_name: "急行バス".into(), route_type: RouteType::Bus },
-                Route { id: RouteId::new("RRAIL"), agency_id: None, short_name: "各停".into(), long_name: "各停".into(), route_type: RouteType::Rail },
+                Route {
+                    id: RouteId::new("RBUS"),
+                    agency_id: None,
+                    short_name: "急行バス".into(),
+                    long_name: "急行バス".into(),
+                    route_type: RouteType::Bus,
+                },
+                Route {
+                    id: RouteId::new("RRAIL"),
+                    agency_id: None,
+                    short_name: "各停".into(),
+                    long_name: "各停".into(),
+                    route_type: RouteType::Rail,
+                },
             ],
             trips: vec![
-                Trip { id: TripId::new("TBUS"), route_id: RouteId::new("RBUS"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown },
-                Trip { id: TripId::new("TRAIL"), route_id: RouteId::new("RRAIL"), service_id: otp_core::ServiceId::new("WD"), headsign: None, wheelchair_accessible: WheelchairBoarding::Unknown },
+                Trip {
+                    id: TripId::new("TBUS"),
+                    route_id: RouteId::new("RBUS"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::Unknown,
+                },
+                Trip {
+                    id: TripId::new("TRAIL"),
+                    route_id: RouteId::new("RRAIL"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::Unknown,
+                },
             ],
             stop_times: vec![
                 // バス: A 08:00 → D 08:10 (速い)
-                StopTime { trip_id: TripId::new("TBUS"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 8 * 3600, departure: 8 * 3600 },
-                StopTime { trip_id: TripId::new("TBUS"), stop_id: StopId::new("D"), stop_sequence: 2, arrival: 8 * 3600 + 600, departure: 8 * 3600 + 600 },
+                StopTime {
+                    trip_id: TripId::new("TBUS"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600,
+                    departure: 8 * 3600,
+                },
+                StopTime {
+                    trip_id: TripId::new("TBUS"),
+                    stop_id: StopId::new("D"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 600,
+                    departure: 8 * 3600 + 600,
+                },
                 // 鉄道: A 08:00 → D 08:25 (遅い)
-                StopTime { trip_id: TripId::new("TRAIL"), stop_id: StopId::new("A"), stop_sequence: 1, arrival: 8 * 3600, departure: 8 * 3600 },
-                StopTime { trip_id: TripId::new("TRAIL"), stop_id: StopId::new("D"), stop_sequence: 2, arrival: 8 * 3600 + 1500, departure: 8 * 3600 + 1500 },
+                StopTime {
+                    trip_id: TripId::new("TRAIL"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600,
+                    departure: 8 * 3600,
+                },
+                StopTime {
+                    trip_id: TripId::new("TRAIL"),
+                    stop_id: StopId::new("D"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 1500,
+                    departure: 8 * 3600 + 1500,
+                },
             ],
-            calendars: vec![Calendar { service_id: otp_core::ServiceId::new("WD"), weekdays: [true, true, true, true, true, false, false], start_date: 20260101, end_date: 20301231 }],
+            calendars: vec![Calendar {
+                service_id: otp_core::ServiceId::new("WD"),
+                weekdays: [true, true, true, true, true, false, false],
+                start_date: 20260101,
+                end_date: 20301231,
+            }],
             ..Feed::default()
         };
         // バスも含めた時刻表 (RailAndBus) で構築しないと、そもそもバスパターンが載らない。
-        let tt = Timetable::build_with_modes(&[feed], ModeFilter::RailAndBus).expect("timetable should build");
+        let tt = Timetable::build_with_modes(&[feed], ModeFilter::RailAndBus)
+            .expect("timetable should build");
         let a = tt.stop_idx(&StopId::new("A")).unwrap();
         let d = tt.stop_idx(&StopId::new("D")).unwrap();
 
         let base = RaptorQuery {
-            access: vec![StreetLink { stop: a, duration_s: 0 }],
-            egress: vec![StreetLink { stop: d, duration_s: 0 }],
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: d,
+                duration_s: 0,
+            }],
             earliest_departure: 8 * 3600,
             service_date: 20260713, // 月曜 (WD 運行)
             max_rounds: 2,
             rail_only: false,
             arrive_by: false,
+            require_wheelchair: false,
         };
 
         // rail_only=false: 速いバスが選ばれる。
         let fast = tt.search(&base).expect("search should not error");
         let fast_best = fast.last().expect("expected a fast journey");
-        assert_eq!(fast_best.arrival_s, 8 * 3600 + 600, "全モードでは速いバス (08:10着) が選ばれるはず");
+        assert_eq!(
+            fast_best.arrival_s,
+            8 * 3600 + 600,
+            "全モードでは速いバス (08:10着) が選ばれるはず"
+        );
         let fast_route = fast_best.legs.iter().find_map(|l| match l {
             JourneyLeg::Transit { route_id, .. } => Some(route_id.as_str().to_string()),
             _ => None,
         });
-        assert_eq!(fast_route.as_deref(), Some("RBUS"), "全モードの最速はバス路線のはず");
+        assert_eq!(
+            fast_route.as_deref(),
+            Some("RBUS"),
+            "全モードの最速はバス路線のはず"
+        );
 
         // rail_only=true: バスはスキップされ、遅い鉄道が返る。
-        let rail = tt.search(&RaptorQuery { rail_only: true, ..base.clone() }).expect("search should not error");
+        let rail = tt
+            .search(&RaptorQuery {
+                rail_only: true,
+                ..base.clone()
+            })
+            .expect("search should not error");
         let rail_best = rail.last().expect("expected a rail journey");
-        assert_eq!(rail_best.arrival_s, 8 * 3600 + 1500, "鉄道限定では鉄道 (08:25着) が返るはず");
+        assert_eq!(
+            rail_best.arrival_s,
+            8 * 3600 + 1500,
+            "鉄道限定では鉄道 (08:25着) が返るはず"
+        );
         let rail_route = rail_best.legs.iter().find_map(|l| match l {
-            JourneyLeg::Transit { route_id, route_type, .. } => Some((route_id.as_str().to_string(), *route_type)),
+            JourneyLeg::Transit {
+                route_id,
+                route_type,
+                ..
+            } => Some((route_id.as_str().to_string(), *route_type)),
             _ => None,
         });
-        assert_eq!(rail_route, Some(("RRAIL".to_string(), RouteType::Rail)), "鉄道限定探索はバスに乗車してはいけない");
+        assert_eq!(
+            rail_route,
+            Some(("RRAIL".to_string(), RouteType::Rail)),
+            "鉄道限定探索はバスに乗車してはいけない"
+        );
+    }
+
+    #[test]
+    fn require_wheelchair_skips_inaccessible_trip_and_takes_next_accessible_one() {
+        use otp_gtfs::{Calendar, Route, RouteType, Stop, StopTime, Trip, WheelchairBoarding};
+        // 同じ A→B 区間に、早い「非対応便 (08:00→08:30, wheelchair=2)」と、遅い
+        // 「対応便 (08:20→08:50, wheelchair=1)」を用意する。require_wheelchair=false では
+        // 早い非対応便が選ばれ、true では非対応便がスキップされ遅い対応便が返るはず。
+        let feed = Feed {
+            stops: vec![
+                Stop {
+                    id: StopId::new("A"),
+                    name: "A".into(),
+                    lat: 35.0,
+                    lng: 139.0,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+                Stop {
+                    id: StopId::new("B"),
+                    name: "B".into(),
+                    lat: 35.2,
+                    lng: 139.2,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+            ],
+            routes: vec![Route {
+                id: RouteId::new("R1"),
+                agency_id: None,
+                short_name: "R1".into(),
+                long_name: "R1".into(),
+                route_type: RouteType::Rail,
+            }],
+            trips: vec![
+                Trip {
+                    id: TripId::new("TNO"),
+                    route_id: RouteId::new("R1"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::NotAccessible,
+                },
+                Trip {
+                    id: TripId::new("TYES"),
+                    route_id: RouteId::new("R1"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::Accessible,
+                },
+            ],
+            stop_times: vec![
+                // 非対応便 TNO: A 08:00 → B 08:30 (早い)
+                StopTime {
+                    trip_id: TripId::new("TNO"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600,
+                    departure: 8 * 3600,
+                },
+                StopTime {
+                    trip_id: TripId::new("TNO"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 1800,
+                    departure: 8 * 3600 + 1800,
+                },
+                // 対応便 TYES: A 08:20 → B 08:50 (遅い)
+                StopTime {
+                    trip_id: TripId::new("TYES"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600 + 1200,
+                    departure: 8 * 3600 + 1200,
+                },
+                StopTime {
+                    trip_id: TripId::new("TYES"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 3000,
+                    departure: 8 * 3600 + 3000,
+                },
+            ],
+            calendars: vec![Calendar {
+                service_id: otp_core::ServiceId::new("WD"),
+                weekdays: [true, true, true, true, true, false, false],
+                start_date: 20260101,
+                end_date: 20301231,
+            }],
+            ..Feed::default()
+        };
+        let tt = Timetable::build(&[feed]).expect("timetable should build");
+        let a = tt.stop_idx(&StopId::new("A")).unwrap();
+        let b = tt.stop_idx(&StopId::new("B")).unwrap();
+        let base = RaptorQuery {
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: b,
+                duration_s: 0,
+            }],
+            earliest_departure: 8 * 3600,
+            service_date: 20260713,
+            max_rounds: 2,
+            rail_only: false,
+            arrive_by: false,
+            require_wheelchair: false,
+        };
+
+        // require_wheelchair=false: 早い非対応便 TNO (08:30着) が選ばれる (従来動作)。
+        let open = tt.search(&base).expect("search should not error");
+        let open_best = open.last().expect("expected a journey");
+        assert_eq!(
+            open_best.arrival_s,
+            8 * 3600 + 1800,
+            "フィルタ無しでは早い非対応便が選ばれる"
+        );
+        let open_trip = open_best.legs.iter().find_map(|l| match l {
+            JourneyLeg::Transit { trip_id, .. } => Some(trip_id.as_str().to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            open_trip.as_deref(),
+            Some("TNO"),
+            "フィルタ無しの最速は非対応便のはず"
+        );
+
+        // require_wheelchair=true: 非対応便はスキップされ、遅い対応便 TYES (08:50着) が返る。
+        let wc = tt
+            .search(&RaptorQuery {
+                require_wheelchair: true,
+                ..base.clone()
+            })
+            .expect("search should not error");
+        let wc_best = wc.last().expect("expected an accessible journey");
+        assert_eq!(
+            wc_best.arrival_s,
+            8 * 3600 + 3000,
+            "車いす要求時は対応便 (08:50着) が返るはず"
+        );
+        let wc_trip = wc_best.legs.iter().find_map(|l| match l {
+            JourneyLeg::Transit { trip_id, .. } => Some(trip_id.as_str().to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            wc_trip.as_deref(),
+            Some("TYES"),
+            "車いす要求時は非対応便に乗ってはいけない"
+        );
+    }
+
+    #[test]
+    fn require_wheelchair_arrive_by_also_skips_inaccessible_trip() {
+        use otp_gtfs::{Calendar, Route, RouteType, Stop, StopTime, Trip, WheelchairBoarding};
+        // arrive-by (後方探索) でも非対応便を弾くこと。締切 09:00 で、最遅の非対応便
+        // TNO (08:20→08:50) ではなく、対応便 TYES (08:00→08:30) が選ばれるはず。
+        let feed = Feed {
+            stops: vec![
+                Stop {
+                    id: StopId::new("A"),
+                    name: "A".into(),
+                    lat: 35.0,
+                    lng: 139.0,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+                Stop {
+                    id: StopId::new("B"),
+                    name: "B".into(),
+                    lat: 35.2,
+                    lng: 139.2,
+                    wheelchair_boarding: WheelchairBoarding::Unknown,
+                    parent_station: None,
+                    zone_id: None,
+                },
+            ],
+            routes: vec![Route {
+                id: RouteId::new("R1"),
+                agency_id: None,
+                short_name: "R1".into(),
+                long_name: "R1".into(),
+                route_type: RouteType::Rail,
+            }],
+            trips: vec![
+                Trip {
+                    id: TripId::new("TYES"),
+                    route_id: RouteId::new("R1"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::Accessible,
+                },
+                Trip {
+                    id: TripId::new("TNO"),
+                    route_id: RouteId::new("R1"),
+                    service_id: otp_core::ServiceId::new("WD"),
+                    headsign: None,
+                    wheelchair_accessible: WheelchairBoarding::NotAccessible,
+                },
+            ],
+            stop_times: vec![
+                // 対応便 TYES: A 08:00 → B 08:30 (早い)
+                StopTime {
+                    trip_id: TripId::new("TYES"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600,
+                    departure: 8 * 3600,
+                },
+                StopTime {
+                    trip_id: TripId::new("TYES"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 1800,
+                    departure: 8 * 3600 + 1800,
+                },
+                // 非対応便 TNO: A 08:20 → B 08:50 (遅い = arrive-by が本来好む最遅出発)
+                StopTime {
+                    trip_id: TripId::new("TNO"),
+                    stop_id: StopId::new("A"),
+                    stop_sequence: 1,
+                    arrival: 8 * 3600 + 1200,
+                    departure: 8 * 3600 + 1200,
+                },
+                StopTime {
+                    trip_id: TripId::new("TNO"),
+                    stop_id: StopId::new("B"),
+                    stop_sequence: 2,
+                    arrival: 8 * 3600 + 3000,
+                    departure: 8 * 3600 + 3000,
+                },
+            ],
+            calendars: vec![Calendar {
+                service_id: otp_core::ServiceId::new("WD"),
+                weekdays: [true, true, true, true, true, false, false],
+                start_date: 20260101,
+                end_date: 20301231,
+            }],
+            ..Feed::default()
+        };
+        let tt = Timetable::build(&[feed]).expect("timetable should build");
+        let a = tt.stop_idx(&StopId::new("A")).unwrap();
+        let b = tt.stop_idx(&StopId::new("B")).unwrap();
+        let query = RaptorQuery {
+            access: vec![StreetLink {
+                stop: a,
+                duration_s: 0,
+            }],
+            egress: vec![StreetLink {
+                stop: b,
+                duration_s: 0,
+            }],
+            earliest_departure: 9 * 3600, // arrive-by: 到着締切 T
+            service_date: 20260713,
+            max_rounds: 2,
+            rail_only: false,
+            arrive_by: true,
+            require_wheelchair: true,
+        };
+        let best = tt
+            .search(&query)
+            .expect("search should not error")
+            .into_iter()
+            .last()
+            .expect("経路が見つからなかった");
+        let trip = best.legs.iter().find_map(|l| match l {
+            JourneyLeg::Transit { trip_id, .. } => Some(trip_id.as_str().to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            trip.as_deref(),
+            Some("TYES"),
+            "arrive-by でも非対応の最遅便ではなく対応便が選ばれるはず"
+        );
+        assert_eq!(best.arrival_s, 8 * 3600 + 1800, "対応便 TYES の 08:30着");
     }
 }

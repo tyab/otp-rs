@@ -172,7 +172,7 @@ fn itinerary_to_node(it: &Itinerary, service_date: u32) -> Value {
     let total = depart_s + it.total_duration_s as i32;
     let start = format_iso(add_days(service_date, (depart_s.div_euclid(86400)) as i64), depart_s.rem_euclid(86400));
     let end = format_iso(add_days(service_date, (total.div_euclid(86400)) as i64), total.rem_euclid(86400));
-    let legs: Vec<Value> = it.legs.iter().map(leg_to_json).collect();
+    let legs: Vec<Value> = it.legs.iter().map(|l| leg_to_json(l, service_date)).collect();
     json!({ "start": start, "end": end, "legs": legs })
 }
 
@@ -184,7 +184,24 @@ fn geometry_json(coords: &[LatLng]) -> Value {
     json!({ "points": encode_polyline(coords), "length": coords.len() })
 }
 
-fn leg_to_json(leg: &Leg) -> Value {
+/// 乗車 leg の地図折れ線を、乗車駅 → 中間停車駅 (実トリップの停車列, 両端を除く) →
+/// 降車駅 の順につなぐ。
+///
+/// `shapes.txt` (実運行の線形) は現状どのフィードにも無く (実測: 都営/メトロ/りんかい/
+/// 京王/東武/自前頻度 GTFS のいずれも同梱せず) `Feed` も読み込んでいないため、
+/// 停車駅の順序に沿う折れ線で近似する (2点直線より実際の駅列に沿う)。停車駅の座標は
+/// GTFS `stops.txt` 由来の実データで、でっち上げは無い。中間駅が無ければ従来どおり
+/// 乗車駅→降車駅の2点線になる。将来 `shapes.txt` を取り込めたら、その線形を
+/// board→alight 区間にクリップした折れ線を優先するのが望ましい (README 参照)。
+fn transit_leg_polyline(from: LatLng, intermediate: &[otp_engine::IntermediateStop], to: LatLng) -> Vec<LatLng> {
+    let mut pts = Vec::with_capacity(intermediate.len() + 2);
+    pts.push(from);
+    pts.extend(intermediate.iter().map(|s| s.coord));
+    pts.push(to);
+    pts
+}
+
+fn leg_to_json(leg: &Leg, service_date: u32) -> Value {
     match leg {
         Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s, has_stairs, has_elevator, geometry } => json!({
             "mode": "WALK",
@@ -199,8 +216,10 @@ fn leg_to_json(leg: &Leg) -> Value {
             "hasStairs": has_stairs,
             "hasElevator": has_elevator,
             "legGeometry": geometry_json(geometry),
+            // 徒歩は途中駅の概念が無いが、乗車 leg と形を揃えるため空配列を出す。
+            "intermediateStops": Vec::<Value>::new(),
         }),
-        Leg::Transit { route_short_name, route_long_name, mode, agency_id, from_name, from_coord, to_name, to_coord, duration_s } => json!({
+        Leg::Transit { route_short_name, route_long_name, mode, agency_id, from_name, from_coord, to_name, to_coord, duration_s, intermediate_stops } => json!({
             "mode": mode,
             "duration": duration_s,
             "distance": from_coord.haversine_m(to_coord),
@@ -208,7 +227,16 @@ fn leg_to_json(leg: &Leg) -> Value {
             "to": place_json(to_name, *to_coord),
             "route": { "longName": route_long_name, "shortName": route_short_name },
             "agency": { "name": "", "gtfsId": agency_id },
-            "legGeometry": geometry_json(&[*from_coord, *to_coord]),
+            "legGeometry": geometry_json(&transit_leg_polyline(*from_coord, intermediate_stops, *to_coord)),
+            // 乗車駅と降車駅の間に停車する中間駅 (途中下車提案用)。arrivalTime は
+            // itinerary.start/end と同じ日跨ぎ補正・ISO 形式で揃える。
+            "intermediateStops": intermediate_stops.iter().map(|s| json!({
+                "name": s.name,
+                "lat": s.coord.lat,
+                "lon": s.coord.lng,
+                "arrivalTime": format_iso(add_days(service_date, (s.arrival_s.div_euclid(86400)) as i64), s.arrival_s.rem_euclid(86400)),
+                "secondsFromBoard": s.seconds_from_board,
+            })).collect::<Vec<_>>(),
         }),
     }
 }
@@ -374,6 +402,81 @@ mod tests {
             // 締切 09:00 以下 (ISO 文字列は同一 TZ 前提で辞書順比較可)。
             assert!(end.as_bytes() <= "2026-07-13T09:00:00+09:00".as_bytes(), "node.end {end} は締切 09:00 以下のはず");
         }
+    }
+
+    #[test]
+    fn gtfs_graphql_transit_leg_includes_intermediate_stops_with_names_and_times() {
+        // mini fixture の T1 (A→B→C) は B駅 を途中に通過する。GraphQL の乗車 leg には
+        // intermediateStops が1件以上入り、各要素に name と arrivalTime があるはず。
+        let engine = build_engine();
+        let body = format!(
+            r#"{{"query":"planConnection","variables":{{
+                "origin":{{"location":{{"coordinate":{{"latitude":{},"longitude":{}}}}}}},
+                "destination":{{"location":{{"coordinate":{{"latitude":{},"longitude":{}}}}}}},
+                "dateTime":{{"earliestDeparture":"2026-07-13T07:57:00+09:00"}},
+                "wheelchair":false}}}}"#,
+            ORIGIN_NEAR_A.lat, ORIGIN_NEAR_A.lng, DEST_NEAR_D.lat, DEST_NEAR_D.lng
+        );
+        let json = handle_gtfs_graphql(&engine, body.as_bytes()).expect("should succeed");
+        let v: Value = serde_json::from_str(&json).expect("valid json");
+        let edges = v["data"]["planConnection"]["edges"].as_array().expect("edges array");
+        assert!(!edges.is_empty(), "経路が返るはず: {json}");
+
+        // 先頭経路の乗車 leg のうち、A駅発 (T1) の leg に B駅 が中間駅として入る。
+        let legs = edges[0]["node"]["legs"].as_array().expect("legs array");
+        let first_transit = legs
+            .iter()
+            .find(|l| l["from"]["name"] == "A駅" && l["mode"] != "WALK")
+            .expect("A駅発の乗車 leg があるはず");
+        let stops = first_transit["intermediateStops"].as_array().expect("intermediateStops array");
+        assert!(!stops.is_empty(), "中間駅が1件以上あるはず: {first_transit}");
+        assert_eq!(stops[0]["name"], "B駅", "中間駅名が解決されるはず");
+        assert!(stops[0]["arrivalTime"].as_str().is_some_and(|t| t.starts_with("2026-07-13T08:05:00")), "arrivalTime は ISO で 08:05: {}", stops[0]);
+        assert_eq!(stops[0]["secondsFromBoard"], 300);
+
+        // legGeometry は乗車駅→中間駅→降車駅 の停車列に沿う折れ線 (2点直線ではない)。
+        // A駅発 T1 (A→B→C1) は中間駅 B が1つなので 頂点は 乗車A + 中間B + 降車C1 = 3点。
+        let geom = &first_transit["legGeometry"];
+        assert_eq!(geom["length"], stops.len() + 2, "折れ線頂点数 = 中間駅数 + 乗降2点: {first_transit}");
+        // デコードして中間駅 B (35.01,139.01) の座標が折れ線の中に現れることを確認する
+        // (直線チョードでは B は含まれない = 停車列に沿っている証拠)。
+        let pts = decode_polyline(geom["points"].as_str().expect("points string"));
+        assert!(
+            pts.iter().any(|(lat, lon)| (lat - 35.01).abs() < 1e-6 && (lon - 139.01).abs() < 1e-6),
+            "折れ線が中間駅 B(35.01,139.01) を通過するはず: {pts:?}"
+        );
+    }
+
+    /// `encode_polyline` の逆。テストで折れ線頂点を復元する (Google encoded polyline, 精度5)。
+    fn decode_polyline(s: &str) -> Vec<(f64, f64)> {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        let (mut lat, mut lng) = (0i64, 0i64);
+        let mut out = Vec::new();
+        let mut read = |i: &mut usize| -> i64 {
+            let mut shift = 0;
+            let mut result = 0i64;
+            loop {
+                let b = (bytes[*i] as i64) - 63;
+                *i += 1;
+                result |= (b & 0x1f) << shift;
+                shift += 5;
+                if b < 0x20 {
+                    break;
+                }
+            }
+            if result & 1 != 0 {
+                !(result >> 1)
+            } else {
+                result >> 1
+            }
+        };
+        while i < bytes.len() {
+            lat += read(&mut i);
+            lng += read(&mut i);
+            out.push((lat as f64 / 1e5, lng as f64 / 1e5));
+        }
+        out
     }
 
     #[test]

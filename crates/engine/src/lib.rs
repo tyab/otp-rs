@@ -45,6 +45,22 @@ pub struct RouteRequest {
     pub arrive_by: bool,
 }
 
+/// 乗車区間 (`Leg::Transit`) が乗車駅と降車駅の **間** に実際に停車・通過する中間駅。
+///
+/// 実トリップの停車列に基づくため、急行等は通過駅を含まない (存在しない停車を合成しない)。
+/// 「途中下車の提案」(通過中の駅で降りる案内) のためにアプリへ渡す。
+#[derive(Debug, Clone)]
+pub struct IntermediateStop {
+    /// 駅名。
+    pub name: String,
+    /// 駅座標。
+    pub coord: LatLng,
+    /// この駅へのトリップ到着時刻 (0時からの秒)。
+    pub arrival_s: SecondsSinceMidnight,
+    /// 乗車時刻からの経過秒 (負値は0にクランプ)。
+    pub seconds_from_board: u32,
+}
+
 /// 応答の1区間 (徒歩 or 乗車)。
 ///
 /// babymobi の Route セグメント (駅名・座標・路線・地図折れ線) を組めるだけの情報を持つ。
@@ -78,6 +94,8 @@ pub enum Leg {
         to_name: String,
         to_coord: LatLng,
         duration_s: u32,
+        /// 乗車駅と降車駅の間に停車する中間駅 (両端を除く)。途中下車提案用。
+        intermediate_stops: Vec<IntermediateStop>,
     },
 }
 
@@ -94,10 +112,14 @@ fn merge_same_route_transit(legs: &[otp_raptor::JourneyLeg]) -> Vec<otp_raptor::
     use otp_raptor::JourneyLeg;
     let mut out: Vec<JourneyLeg> = Vec::with_capacity(legs.len());
     for leg in legs {
-        if let JourneyLeg::Transit { route_id, from, to, board_s, alight_s, .. } = leg {
-            if let Some(JourneyLeg::Transit { route_id: p_route, to: p_to, alight_s: p_alight, .. }) = out.last_mut() {
+        if let JourneyLeg::Transit { route_id, from, to, board_s, alight_s, intermediate, .. } = leg {
+            if let Some(JourneyLeg::Transit { route_id: p_route, to: p_to, alight_s: p_alight, intermediate: p_intermediate, .. }) = out.last_mut() {
                 if *p_route == *route_id && *p_to == *from && *p_alight == *board_s {
-                    // 待ち0の連続 → 直前 leg の終端を今の leg の終端まで伸ばす (中間駅は捨てる)。
+                    // 待ち0の連続 → 直前 leg の終端を今の leg の終端まで伸ばす。
+                    // 境界駅 (直前の降車 = 今の乗車) は途中下車候補として中間駅に格納し、
+                    // 続いて継続 leg 自身の中間駅を連結する (境界駅が先、次に第2 leg の中間駅)。
+                    p_intermediate.push((*p_to, *p_alight));
+                    p_intermediate.extend(intermediate.iter().cloned());
                     *p_to = *to;
                     *p_alight = *alight_s;
                     continue;
@@ -252,6 +274,10 @@ impl Engine {
         // 実測)。鉄道限定の第2探索を別途走らせ、バスに勝てなくても鉄道の代替を拾う。
         //   q_fast … 全モード。最速 (バスになりうる)。
         //   q_rail … 鉄道限定。鉄道のみの代替経路。
+        // 車いす/ベビーカーは、明示的にバリアフリー非対応の便への乗車を避ける
+        // (`RaptorQuery::require_wheelchair`)。ベビーカーも段差/ホーム隙間を車いす同様に
+        // 避けたいため対象に含める (このアプリの主軸)。solo はフィルタ無しで従来動作。
+        let require_wheelchair = matches!(req.mobility, Mobility::Wheelchair | Mobility::Stroller);
         let q_fast = otp_raptor::RaptorQuery {
             access: access.links.clone(),
             egress: egress.links.clone(),
@@ -260,6 +286,7 @@ impl Engine {
             max_rounds: MAX_RAPTOR_ROUNDS,
             rail_only: false,
             arrive_by: req.arrive_by,
+            require_wheelchair,
         };
         let q_rail = otp_raptor::RaptorQuery {
             access: access.links,
@@ -269,6 +296,7 @@ impl Engine {
             max_rounds: MAX_RAPTOR_ROUNDS,
             rail_only: true,
             arrive_by: req.arrive_by,
+            require_wheelchair,
         };
 
         let fast_journeys = self.timetable.search(&q_fast)?;
@@ -433,13 +461,19 @@ impl Engine {
                     cursor_coord = to_coord;
                     legs.push(Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s: *duration_s, has_stairs, has_elevator, geometry });
                 }
-                otp_raptor::JourneyLeg::Transit { route_short_name, route_long_name, route_type, agency_id, from, to, board_s, alight_s, .. } => {
+                otp_raptor::JourneyLeg::Transit { route_short_name, route_long_name, route_type, agency_id, from, to, board_s, alight_s, intermediate, .. } => {
                     let from_name = self.timetable.stop_name(*from).to_string();
                     let from_coord = self.timetable.stop_coord(*from);
                     let to_name = self.timetable.stop_name(*to).to_string();
                     let to_coord = self.timetable.stop_coord(*to);
                     cursor_name = to_name.clone();
                     cursor_coord = to_coord;
+                    let intermediate_stops = intermediate.iter().map(|(sidx, arr)| IntermediateStop {
+                        name: self.timetable.stop_name(*sidx).to_string(),
+                        coord: self.timetable.stop_coord(*sidx),
+                        arrival_s: *arr,
+                        seconds_from_board: (*arr - *board_s).max(0) as u32,
+                    }).collect();
                     legs.push(Leg::Transit {
                         route_short_name: route_short_name.clone(),
                         route_long_name: route_long_name.clone(),
@@ -450,6 +484,7 @@ impl Engine {
                         to_name,
                         to_coord,
                         duration_s: (alight_s - board_s).max(0) as u32,
+                        intermediate_stops,
                     });
                 }
             }
@@ -580,14 +615,17 @@ mod tests {
             to,
             board_s: board,
             alight_s: alight,
+            intermediate: vec![],
         };
         // (A) 同一路線(大江戸線)を都庁前(stop5)で分割した連続 Transit → 1本に統合。
         let split = vec![transit("Oedo", 1, 5, 28800, 28860), transit("Oedo", 5, 9, 28860, 29760)];
         let m = merge_same_route_transit(&split);
         assert_eq!(m.len(), 1, "同一路線・同一停留所の連続は1本に");
         match &m[0] {
-            JourneyLeg::Transit { from, to, board_s, alight_s, .. } => {
+            JourneyLeg::Transit { from, to, board_s, alight_s, intermediate, .. } => {
                 assert_eq!((*from, *to, *board_s, *alight_s), (1, 9, 28800, 29760), "先頭from/board〜末尾to/alightに伸びる");
+                // 統合で捨てられていた境界駅 (stop5, 到着28860) が中間駅として保持される。
+                assert_eq!(intermediate, &vec![(5u32, 28860i32)], "境界駅が中間駅に格納される");
             }
             _ => panic!("Transitのはず"),
         }

@@ -13,7 +13,10 @@ use otp_gtfs::Feed;
 use otp_raptor::{RaptorQuery, StreetLink, Timetable};
 
 fn default_zip_path() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../infra/otp/data/toei-train-gtfs.zip"))
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../infra/otp/data/toei-train-gtfs.zip"
+    ))
 }
 
 fn prepare_data_dir() -> Option<PathBuf> {
@@ -22,20 +25,34 @@ fn prepare_data_dir() -> Option<PathBuf> {
         if path.is_dir() {
             return Some(path);
         }
-        eprintln!("OTP_RS_GTFS_DIR={} は存在しないディレクトリ。skip します。", path.display());
+        eprintln!(
+            "OTP_RS_GTFS_DIR={} は存在しないディレクトリ。skip します。",
+            path.display()
+        );
         return None;
     }
 
-    let zip_path = std::env::var("OTP_RS_GTFS_ZIP").map(PathBuf::from).unwrap_or_else(|_| default_zip_path());
+    let zip_path = std::env::var("OTP_RS_GTFS_ZIP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_zip_path());
     if !zip_path.is_file() {
-        eprintln!("実データ GTFS zip が見つかりません ({}). skip します。", zip_path.display());
+        eprintln!(
+            "実データ GTFS zip が見つかりません ({}). skip します。",
+            zip_path.display()
+        );
         return None;
     }
 
     let out_dir = std::env::temp_dir().join("otp-rs-toei-gtfs-test"); // gtfs crate のテストと共有 (同一zip)
     if !already_extracted(&out_dir) {
         std::fs::create_dir_all(&out_dir).ok()?;
-        let status = Command::new("unzip").arg("-o").arg("-q").arg(&zip_path).arg("-d").arg(&out_dir).status();
+        let status = Command::new("unzip")
+            .arg("-o")
+            .arg("-q")
+            .arg(&zip_path)
+            .arg("-d")
+            .arg(&out_dir)
+            .status();
         match status {
             Ok(s) if s.success() => {}
             _ => {
@@ -53,31 +70,55 @@ fn already_extracted(dir: &Path) -> bool {
 
 #[test]
 fn shinjuku_to_hongo_sanchome_returns_sane_journey() {
-    let Some(dir) = prepare_data_dir() else { return };
+    let Some(dir) = prepare_data_dir() else {
+        return;
+    };
     let feed = Feed::load_from_dir(&dir).expect("実データ feed のロードに失敗");
     let tt = Timetable::build(std::slice::from_ref(&feed)).expect("timetable should build");
 
     // 実測 (infra/otp/data/toei-train-gtfs.zip の stops.txt): 新宿(大江戸線 E-27)=428,
     // 本郷三丁目(大江戸線 E-08)=409。
-    let shinjuku = tt.stop_idx(&otp_core::StopId::new("428")).expect("新宿 (428) が時刻表に無い");
-    let hongo = tt.stop_idx(&otp_core::StopId::new("409")).expect("本郷三丁目 (409) が時刻表に無い");
+    let shinjuku = tt
+        .stop_idx(&otp_core::StopId::new("428"))
+        .expect("新宿 (428) が時刻表に無い");
+    let hongo = tt
+        .stop_idx(&otp_core::StopId::new("409"))
+        .expect("本郷三丁目 (409) が時刻表に無い");
 
     let query = RaptorQuery {
-        access: vec![StreetLink { stop: shinjuku, duration_s: 0 }],
-        egress: vec![StreetLink { stop: hongo, duration_s: 0 }],
+        access: vec![StreetLink {
+            stop: shinjuku,
+            duration_s: 0,
+        }],
+        egress: vec![StreetLink {
+            stop: hongo,
+            duration_s: 0,
+        }],
         earliest_departure: 8 * 3600, // 08:00:00
         service_date: 20260713,       // 月曜日 (calendar.txt の実測値と付き合わせ済み)
         max_rounds: 4,
         rail_only: false,
         arrive_by: false,
+        require_wheelchair: false,
     };
 
     let journeys = tt.search(&query).expect("search should not panic/error");
-    assert!(!journeys.is_empty(), "新宿→本郷三丁目 の経路が1つも見つからなかった");
+    assert!(
+        !journeys.is_empty(),
+        "新宿→本郷三丁目 の経路が1つも見つからなかった"
+    );
 
     for j in &journeys {
-        assert!(j.arrival_s > query.earliest_departure, "到着が出発より前: {}", j.arrival_s);
-        assert!(j.transfers <= query.max_rounds, "乗換回数が上限超過: {}", j.transfers);
+        assert!(
+            j.arrival_s > query.earliest_departure,
+            "到着が出発より前: {}",
+            j.arrival_s
+        );
+        assert!(
+            j.transfers <= query.max_rounds,
+            "乗換回数が上限超過: {}",
+            j.transfers
+        );
         assert!(!j.legs.is_empty());
     }
 
@@ -103,38 +144,61 @@ fn shinjuku_to_hongo_sanchome_returns_sane_journey() {
 /// 08:01発→08:25着 となり、到着時刻が本家と完全一致することを固定する回帰テスト。
 #[test]
 fn shinjuku_to_hongo_sanchome_transfer_respects_default_buffer() {
-    let Some(dir) = prepare_data_dir() else { return };
+    let Some(dir) = prepare_data_dir() else {
+        return;
+    };
     let feed = Feed::load_from_dir(&dir).expect("実データ feed のロードに失敗");
     let tt = Timetable::build(std::slice::from_ref(&feed)).expect("timetable should build");
 
-    let shinjuku = tt.stop_idx(&otp_core::StopId::new("428")).expect("新宿 (428) が時刻表に無い");
-    let hongo = tt.stop_idx(&otp_core::StopId::new("409")).expect("本郷三丁目 (409) が時刻表に無い");
+    let shinjuku = tt
+        .stop_idx(&otp_core::StopId::new("428"))
+        .expect("新宿 (428) が時刻表に無い");
+    let hongo = tt
+        .stop_idx(&otp_core::StopId::new("409"))
+        .expect("本郷三丁目 (409) が時刻表に無い");
 
     let query = RaptorQuery {
-        access: vec![StreetLink { stop: shinjuku, duration_s: 0 }],
-        egress: vec![StreetLink { stop: hongo, duration_s: 0 }],
+        access: vec![StreetLink {
+            stop: shinjuku,
+            duration_s: 0,
+        }],
+        egress: vec![StreetLink {
+            stop: hongo,
+            duration_s: 0,
+        }],
         earliest_departure: 8 * 3600,
         service_date: 20260713,
         max_rounds: 4,
         rail_only: false,
         arrive_by: false,
+        require_wheelchair: false,
     };
 
     let journeys = tt.search(&query).expect("search should not panic/error");
     let best = journeys.last().expect("経路が見つからなかった");
 
     assert_eq!(best.transfers, 1, "都庁前で1回乗換のはず: {best:?}");
-    assert_eq!(best.arrival_s, 8 * 3600 + 25 * 60, "本家 OTP 実測 (08:25着) と一致するはず: {best:?}");
+    assert_eq!(
+        best.arrival_s,
+        8 * 3600 + 25 * 60,
+        "本家 OTP 実測 (08:25着) と一致するはず: {best:?}"
+    );
 
     let transit_legs: Vec<_> = best
         .legs
         .iter()
         .filter_map(|l| match l {
-            otp_raptor::JourneyLeg::Transit { board_s, alight_s, .. } => Some((*board_s, *alight_s)),
+            otp_raptor::JourneyLeg::Transit {
+                board_s, alight_s, ..
+            } => Some((*board_s, *alight_s)),
             _ => None,
         })
         .collect();
-    assert_eq!(transit_legs.len(), 2, "大江戸線を2本乗り継ぐはず: {transit_legs:?}");
+    assert_eq!(
+        transit_legs.len(),
+        2,
+        "大江戸線を2本乗り継ぐはず: {transit_legs:?}"
+    );
     let (_, first_alight) = transit_legs[0];
     let (second_board, _) = transit_legs[1];
     assert!(

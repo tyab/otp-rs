@@ -136,6 +136,39 @@ fn wheelchair_walks_slower_than_solo_so_total_duration_is_not_shorter() {
 }
 
 #[test]
+fn transit_leg_exposes_intermediate_stops_with_resolved_names() {
+    let engine = build_engine();
+    let itineraries = engine.plan(&base_request(Mobility::Solo)).expect("plan should not error");
+    let best = &itineraries[0];
+
+    // 先頭の乗車 leg (A駅→C駅, T1) は B駅 を途中に通過する。
+    // T1: A(08:00)→B(08:05)→C1(08:10)。中間駅は B駅 のみ、到着08:05。
+    let first_transit = best
+        .legs
+        .iter()
+        .find_map(|l| match l {
+            Leg::Transit { from_name, intermediate_stops, .. } if from_name == "A駅" => Some(intermediate_stops.clone()),
+            _ => None,
+        })
+        .expect("A駅発の Transit leg があるはず");
+    assert_eq!(first_transit.len(), 1, "中間駅は B駅 の1つ: {first_transit:?}");
+    assert_eq!(first_transit[0].name, "B駅", "中間駅名が解決されるはず");
+    assert_eq!(first_transit[0].arrival_s, 8 * 3600 + 300, "B駅到着は08:05");
+    assert_eq!(first_transit[0].seconds_from_board, 300, "乗車(08:00)からの経過は300秒");
+
+    // 2本目 C駅→D駅 (T2) は直行で中間駅なし。
+    let second_transit = best
+        .legs
+        .iter()
+        .find_map(|l| match l {
+            Leg::Transit { from_name, intermediate_stops, .. } if from_name == "C駅" => Some(intermediate_stops.clone()),
+            _ => None,
+        })
+        .expect("C駅発の Transit leg があるはず");
+    assert!(second_transit.is_empty(), "C駅→D駅 直行は中間駅なし: {second_transit:?}");
+}
+
+#[test]
 fn plan_returns_empty_when_street_graph_is_unbuilt() {
     let feed = Feed::load_from_dir(&fixture_dir()).expect("mini fixture should load");
     let timetable = Timetable::build(&[feed]).expect("timetable should build");

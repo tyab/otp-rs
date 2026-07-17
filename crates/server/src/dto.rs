@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use otp_core::LatLng;
-use otp_engine::{Itinerary, Leg, Mobility, RouteRequest};
+use otp_engine::{IntermediateStop, Itinerary, Leg, Mobility, RouteRequest};
 
 #[derive(Debug, Deserialize)]
 pub struct LatLngDto {
@@ -105,6 +105,34 @@ impl From<LatLng> for CoordDto {
     }
 }
 
+/// 乗車区間が通過する中間駅の出力用 DTO (途中下車提案用)。
+///
+/// REST `/plan` は service_date を DTO 層まで通していないため、GraphQL 側の ISO 時刻
+/// (`arrivalTime`) の代わりに 0時からの生秒 (`arrivalSecondsSinceMidnight`) を出す。
+/// 座標フィールドは GraphQL と揃えて `lat`/`lon`。
+#[derive(Debug, Serialize)]
+pub struct IntermediateStopDto {
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(rename = "arrivalSecondsSinceMidnight")]
+    pub arrival_s: i32,
+    #[serde(rename = "secondsFromBoard")]
+    pub seconds_from_board: u32,
+}
+
+impl From<&IntermediateStop> for IntermediateStopDto {
+    fn from(s: &IntermediateStop) -> Self {
+        IntermediateStopDto {
+            name: s.name.clone(),
+            lat: s.coord.lat,
+            lon: s.coord.lng,
+            arrival_s: s.arrival_s,
+            seconds_from_board: s.seconds_from_board,
+        }
+    }
+}
+
 /// `mode` タグで WALK/TRANSIT を判別する (フロント側が `switch(leg.mode)` できる形)。
 #[derive(Debug, Serialize)]
 #[serde(tag = "mode")]
@@ -123,6 +151,9 @@ pub enum LegDto {
         has_stairs: bool,
         /// 折れ線 (始点→終点)。
         geometry: Vec<CoordDto>,
+        /// 徒歩は途中駅の概念が無いが、乗車 leg と形を揃えるため空配列を出す。
+        #[serde(rename = "intermediateStops")]
+        intermediate_stops: Vec<IntermediateStopDto>,
     },
     #[serde(rename = "TRANSIT")]
     Transit {
@@ -139,6 +170,9 @@ pub enum LegDto {
         to_name: String,
         #[serde(rename = "durationS")]
         duration_s: u32,
+        /// 乗車駅と降車駅の間に停車する中間駅 (途中下車提案用)。
+        #[serde(rename = "intermediateStops")]
+        intermediate_stops: Vec<IntermediateStopDto>,
     },
 }
 
@@ -169,14 +203,16 @@ impl LegDto {
                 duration_s: *duration_s,
                 has_stairs: *has_stairs,
                 geometry: geometry.iter().map(|c| (*c).into()).collect(),
+                intermediate_stops: vec![],
             },
-            Leg::Transit { route_short_name, route_long_name, mode, from_name, to_name, duration_s, .. } => LegDto::Transit {
+            Leg::Transit { route_short_name, route_long_name, mode, from_name, to_name, duration_s, intermediate_stops, .. } => LegDto::Transit {
                 route_name: route_short_name.clone(),
                 route_long_name: route_long_name.clone(),
                 transit_mode: mode.to_string(),
                 from_name: from_name.clone(),
                 to_name: to_name.clone(),
                 duration_s: *duration_s,
+                intermediate_stops: intermediate_stops.iter().map(IntermediateStopDto::from).collect(),
             },
         }
     }
@@ -271,6 +307,12 @@ mod tests {
                     to_name: "本郷三丁目".to_string(),
                     to_coord: LatLng::new(35.707, 139.759),
                     duration_s: 1200,
+                    intermediate_stops: vec![IntermediateStop {
+                        name: "市ヶ谷".to_string(),
+                        coord: LatLng::new(35.693, 139.735),
+                        arrival_s: 8 * 3600 + 600,
+                        seconds_from_board: 600,
+                    }],
                 },
             ],
             total_duration_s: 1400,
@@ -286,6 +328,11 @@ mod tests {
         assert!(json.contains("\"fareYen\":220.0"));
         assert!(json.contains("\"routeName\":\"新宿線\""));
         assert!(json.contains("\"routeLongName\":\"都営新宿線\""));
+        // 乗車 leg の中間駅が REST DTO にも出る (ISO ではなく生秒 + 経過秒)。
+        assert!(json.contains("\"intermediateStops\":[{"), "中間駅配列があるはず: {json}");
+        assert!(json.contains("\"name\":\"市ヶ谷\""), "中間駅名: {json}");
+        assert!(json.contains("\"arrivalSecondsSinceMidnight\":29400"), "中間駅の生秒: {json}");
+        assert!(json.contains("\"secondsFromBoard\":600"), "乗車からの経過秒: {json}");
     }
 
     #[test]
