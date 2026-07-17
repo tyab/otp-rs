@@ -203,22 +203,30 @@ fn transit_leg_polyline(from: LatLng, intermediate: &[otp_engine::IntermediateSt
 
 fn leg_to_json(leg: &Leg, service_date: u32) -> Value {
     match leg {
-        Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s, has_stairs, has_elevator, geometry } => json!({
-            "mode": "WALK",
-            "duration": duration_s,
-            "distance": distance_m,
-            "from": place_json(from_name, *from_coord),
-            "to": place_json(to_name, *to_coord),
-            "route": Value::Null,
-            "agency": Value::Null,
+        Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s, has_stairs, has_elevator, street_routed, geometry } => {
+            let mut v = json!({
+                "mode": "WALK",
+                "duration": duration_s,
+                "distance": distance_m,
+                "from": place_json(from_name, *from_coord),
+                "to": place_json(to_name, *to_coord),
+                "route": Value::Null,
+                "agency": Value::Null,
+                "legGeometry": geometry_json(geometry),
+                // 徒歩は途中駅の概念が無いが、乗車 leg と形を揃えるため空配列を出す。
+                "intermediateStops": Vec::<Value>::new(),
+            });
             // OTP 標準の Leg には無い拡張フィールド (babymobi mapper が読む)。徒歩区間の
-            // 段差/エレベーターは OSM 由来の実データ。
-            "hasStairs": has_stairs,
-            "hasElevator": has_elevator,
-            "legGeometry": geometry_json(geometry),
-            // 徒歩は途中駅の概念が無いが、乗車 leg と形を揃えるため空配列を出す。
-            "intermediateStops": Vec::<Value>::new(),
-        }),
+            // 段差/エレベーターは OSM 由来の実データだが、街路経路を引けなかった
+            // 2点直線フォールバック (street_routed=false) では未検証なのでキー自体を
+            // 出さない (mapper はキー欠落を「データ未反映」注記として表示する。
+            // false を出すと「階段なしを検証済み」という嘘になる)。
+            if *street_routed {
+                v["hasStairs"] = json!(has_stairs);
+                v["hasElevator"] = json!(has_elevator);
+            }
+            v
+        }
         Leg::Transit { route_short_name, route_long_name, mode, agency_id, from_name, from_coord, to_name, to_coord, duration_s, intermediate_stops } => json!({
             "mode": mode,
             "duration": duration_s,
@@ -477,6 +485,34 @@ mod tests {
             out.push((lat as f64 / 1e5, lng as f64 / 1e5));
         }
         out
+    }
+
+    #[test]
+    fn walk_leg_json_omits_accessibility_keys_unless_street_routed() {
+        let make = |street_routed: bool| Leg::Walk {
+            from_name: "丸ノ内線新宿".to_string(),
+            from_coord: LatLng::new(35.691, 139.699),
+            to_name: "京王線新宿".to_string(),
+            to_coord: LatLng::new(35.689, 139.699),
+            distance_m: if street_routed { 324.0 } else { 0.0 },
+            duration_s: 369,
+            has_stairs: true,
+            has_elevator: false,
+            street_routed,
+            geometry: vec![LatLng::new(35.691, 139.699), LatLng::new(35.689, 139.699)],
+        };
+
+        // street_routed=false (街路経路を引けなかったフォールバック): 未検証の
+        // 段差/EV をキーごと省略する (babymobi mapper がキー欠落を「データ未反映」
+        // 注記として表示する。false を出すと「階段なしを検証済み」という嘘になる)。
+        let v = leg_to_json(&make(false), 20260713);
+        assert!(v.get("hasStairs").is_none(), "未検証の徒歩に hasStairs キーを出さない: {v}");
+        assert!(v.get("hasElevator").is_none(), "未検証の徒歩に hasElevator キーを出さない: {v}");
+
+        // street_routed=true (実経路あり): OSM 由来の実データとしてキーを出す。
+        let v = leg_to_json(&make(true), 20260713);
+        assert_eq!(v["hasStairs"], true, "検証済みの徒歩は hasStairs を出す: {v}");
+        assert_eq!(v["hasElevator"], false, "検証済みの徒歩は hasElevator を出す: {v}");
     }
 
     #[test]

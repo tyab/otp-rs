@@ -64,8 +64,9 @@ pub struct IntermediateStop {
 /// 応答の1区間 (徒歩 or 乗車)。
 ///
 /// babymobi の Route セグメント (駅名・座標・路線・地図折れ線) を組めるだけの情報を持つ。
-/// `from`/`to` は「発地→着地」の名前と座標。徒歩の access/egress は `geometry` に街路の
-/// 実経路 (折れ線) を持ち、乗換 (footpath) と乗車は 2点直線になる。
+/// `from`/`to` は「発地→着地」の名前と座標。徒歩の access/egress と、街路経路が引けた
+/// footpath 乗換は `geometry` に街路の実経路 (折れ線) を持つ。引けなかった徒歩は 2点直線
+/// (`street_routed=false`)、乗車は停車列に沿う折れ線 (server 側で組む)。
 #[derive(Debug, Clone)]
 pub enum Leg {
     Walk {
@@ -78,8 +79,15 @@ pub enum Leg {
         has_stairs: bool,
         /// この徒歩区間がエレベーターを経由するか (アクセシビリティ明示用)。
         has_elevator: bool,
+        /// 街路グラフで実経路を引けたか。`false` は 2点直線フォールバック
+        /// (経路が引けなかった access/egress、または街路経路が引けなかった/信用
+        /// できなかった footpath 乗換) で、`distance_m`/`has_stairs`/`has_elevator`
+        /// は **未検証** を意味する。サーバはこの場合 hasStairs/hasElevator キーを
+        /// 出力しない (「階段なし」と未検証を混同させないため。babymobi mapper は
+        /// キー欠落を「データ未反映」注記として表示する)。
+        street_routed: bool,
         /// 地図表示用の折れ線 (始点→終点)。access/egress は街路A*の実経路、
-        /// 近接駅の footpath 乗換は 2点直線。
+        /// footpath 乗換も街路経路が引けたら実経路 (引けなければ 2点直線)。
         geometry: Vec<LatLng>,
     },
     Transit {
@@ -203,6 +211,23 @@ const MAX_RAPTOR_ROUNDS: u8 = 5;
 /// この上限内でも最低1本は残す (`plan` の truncate 参照)。
 const MAX_ITINERARIES: usize = 4;
 
+/// footpath 乗換の街路経路を採用する上限の「見かけ速度」(m/s)。RAPTOR の乗換所要
+/// (直線距離 / 1.3m/s + バッファ) はそのまま保持する (時刻表計算に使用済みのため)
+/// 一方、街路距離が `duration_s ×` この値を超える経路は「直線近似と乖離しすぎた
+/// 大回り」とみなして捨て、正直な 2点直線フォールバック (`street_routed=false`)
+/// に落とす。徒歩 ~1.3m/s に対し 3.0 は正当な迂回 (階段回避等) を許す十分な余裕。
+const MAX_TRANSFER_STREET_SPEED_MPS: f32 = 3.0;
+
+/// footpath 乗換の街路経路キャッシュのキー (from座標, to座標)。`LatLng` (f64) は
+/// `Hash`/`Eq` を持たないため、ビット表現で持つ (同一駅座標同士なら完全一致する)。
+/// 同一 `plan()` 内では WalkProfile が固定なので profile はキーに含めない。
+type TransferPairKey = ((u64, u64), (u64, u64));
+
+/// [`TransferPairKey`] 用の座標→ビット表現。
+fn coord_key(c: LatLng) -> (u64, u64) {
+    (c.lat.to_bits(), c.lng.to_bits())
+}
+
 /// エンジン本体。構築済みグラフ/時刻表/運賃モデルを保持し、リクエストに応答する。
 ///
 /// これがネイティブサーバ (otp-server) の中身であり、将来 wasm32 で Worker に載せる対象。
@@ -245,9 +270,10 @@ impl Engine {
     ///   3. 返ってきた `Journey` 群を `Itinerary` (Leg::Walk / Leg::Transit) に
     ///      変換する。先頭/末尾の `JourneyLeg::Walk` は access/egress の
     ///      `WalkPath` (手順1で保持済み) から distance_m・has_stairs を補う。
-    ///      RAPTOR 内部の乗換徒歩 (footpath, 近接駅間の直線距離近似) は
-    ///      distance_m を持たないため 0.0 とする (既知の限界。`otp_raptor` の
-    ///      モジュール doc 参照)。
+    ///      RAPTOR 内部の乗換徒歩 (footpath) も同じ profile で街路 A* を引き、
+    ///      実ジオメトリ・実距離・実段差/EV を補う (引けなければ 2点直線 +
+    ///      `street_routed=false` の正直なフォールバック。所要秒は常に RAPTOR の
+    ///      乗換所要のまま。`transfer_street_path` 参照)。
     ///   4. 到着が早い順 (`total_duration_s` 昇順) にソートして返す。
     ///
     /// 運賃 (`fare_yen`) は各 `Journey` から [`Engine::compute_fare`] で計算する
@@ -301,12 +327,16 @@ impl Engine {
 
         let fast_journeys = self.timetable.search(&q_fast)?;
 
+        // footpath 乗換の街路経路キャッシュ。同一 plan() 内の複数 itinerary (fast/rail、
+        // Pareto 集合) が同じ駅対の乗換を繰り返すことが多く、A* を1回に抑える。
+        let mut transfer_cache: HashMap<TransferPairKey, Option<otp_street::WalkPath>> = HashMap::new();
+
         // fast を先に Itinerary 化し、乗車 leg の並び (路線名 + 発着駅名) を
         // シグネチャにして重複排除する (fast 内の Pareto 重複も畳む)。
         let mut fast_its: Vec<Itinerary> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for j in &fast_journeys {
-            let it = self.journey_to_itinerary(j, req, &access.paths, &egress.paths);
+            let it = self.journey_to_itinerary(j, req, &profile, &access.paths, &egress.paths, &mut transfer_cache);
             if seen.insert(itinerary_signature(&it)) {
                 fast_its.push(it);
             }
@@ -327,7 +357,7 @@ impl Engine {
             // 鉄道限定の結果のうち、fast に既出でない経路だけを「鉄道の代替」として拾う。
             // 鉄道が到達不能なら rail_journeys は空で代替は増えない (fast だけを返す)。
             for j in &rail_journeys {
-                let it = self.journey_to_itinerary(j, req, &access.paths, &egress.paths);
+                let it = self.journey_to_itinerary(j, req, &profile, &access.paths, &egress.paths, &mut transfer_cache);
                 if seen.insert(itinerary_signature(&it)) {
                     rail_its.push(it);
                 }
@@ -412,13 +442,51 @@ impl Engine {
         WalkLinks { links, paths: path_map }
     }
 
+    /// footpath 乗換 (RAPTOR 内部の近接駅徒歩) の街路経路を引く。採用できない場合は
+    /// `None` (呼び出し側が 2点直線 + `street_routed=false` に落とす)。
+    ///
+    /// - profile は access/egress と同一 (リクエストの mobility 由来) を使う。
+    /// - A* の生結果 (成功/失敗) は `cache` に入れ、同一 plan() 内の同じ駅対の
+    ///   再計算を避ける (妥当性判定はキャッシュの後段で毎回行う)。
+    /// - 採用条件: 経路が引けて (`nodes` 2点以上)、距離が正で、かつ RAPTOR の
+    ///   乗換所要に対し [`MAX_TRANSFER_STREET_SPEED_MPS`] を超える大回りでないこと。
+    ///   両端が同一ノードにスナップされた (駅対の近くに街路が無い) 場合は距離0/
+    ///   1点経路になり、ここで弾かれる。
+    fn transfer_street_path(
+        &self,
+        from: LatLng,
+        to: LatLng,
+        raptor_duration_s: u32,
+        profile: &WalkProfile,
+        cache: &mut HashMap<TransferPairKey, Option<otp_street::WalkPath>>,
+    ) -> Option<otp_street::WalkPath> {
+        let key = (coord_key(from), coord_key(to));
+        let path = cache
+            .entry(key)
+            .or_insert_with(|| self.street.route(from, to, profile).ok())
+            .clone()?;
+        if path.nodes.len() < 2 || path.distance_m <= 0.0 {
+            return None;
+        }
+        if path.distance_m > raptor_duration_s as f32 * MAX_TRANSFER_STREET_SPEED_MPS {
+            return None;
+        }
+        Some(path)
+    }
+
     /// RAPTOR の `Journey` を engine の `Itinerary` へ変換する。
+    ///
+    /// `profile` は `plan()` がリクエストの mobility から作った `WalkProfile`
+    /// (access/egress と同じもの)。footpath 乗換の街路経路 (`transfer_street_path`)
+    /// に使う。`transfer_cache` は同一 plan() 内で itinerary をまたいで共有する。
     fn journey_to_itinerary(
         &self,
         journey: &otp_raptor::Journey,
         req: &RouteRequest,
+        profile: &WalkProfile,
         access_paths: &HashMap<otp_raptor::StopIdx, otp_street::WalkPath>,
         egress_paths: &HashMap<otp_raptor::StopIdx, otp_street::WalkPath>,
+        transfer_cache: &mut HashMap<TransferPairKey, Option<otp_street::WalkPath>>,
     ) -> Itinerary {
         // 同一路線・同一停留所での連続 Transit を1本にまとめてから変換する。RAPTOR は
         // ループ線の分岐 (例: 都営大江戸線 都庁前) で同一路線を別パターンとして分割し、
@@ -437,29 +505,43 @@ impl Engine {
                 otp_raptor::JourneyLeg::Walk { stop, duration_s } => {
                     let stop_name = self.timetable.stop_name(*stop).to_string();
                     let stop_coord = self.timetable.stop_coord(*stop);
-                    let (from_name, from_coord, to_name, to_coord, distance_m, has_stairs, has_elevator, geometry) = if i == 0 {
+                    let (from_name, from_coord, to_name, to_coord, distance_m, has_stairs, has_elevator, street_routed, geometry) = if i == 0 {
                         // access: 出発地 → 乗車駅。街路A*の実経路をジオメトリに。
+                        // 経路が引けなかった駅 (map に無い) は距離・段差が未検証なので
+                        // street_routed=false (通常は WalkLinks 構築時点で候補から落ちる
+                        // ため到達しないが、フォールバック時に嘘をつかないための保険)。
                         let p = access_paths.get(stop);
                         let geom = p.map(|p| self.street.path_coords(p)).unwrap_or_default();
                         let (d, s, e) = p.map(|p| (p.distance_m, p.has_stairs, p.has_elevator)).unwrap_or((0.0, false, false));
-                        (cursor_name.clone(), cursor_coord, stop_name, stop_coord, d, s, e, geom)
+                        (cursor_name.clone(), cursor_coord, stop_name, stop_coord, d, s, e, p.is_some(), geom)
                     } else if i == last_idx {
                         // egress: 降車駅 → 目的地。
                         let p = egress_paths.get(stop);
                         let geom = p.map(|p| self.street.path_coords(p)).unwrap_or_default();
                         let (d, s, e) = p.map(|p| (p.distance_m, p.has_stairs, p.has_elevator)).unwrap_or((0.0, false, false));
-                        (cursor_name.clone(), cursor_coord, "目的地".to_string(), req.destination, d, s, e, geom)
+                        (cursor_name.clone(), cursor_coord, "目的地".to_string(), req.destination, d, s, e, p.is_some(), geom)
                     } else {
-                        // RAPTOR 内部の近接駅徒歩乗換 (footpath)。直線距離近似のため距離・段差は
-                        // 保持せず、ジオメトリは 2点直線 (otp_raptor モジュール doc 参照)。
-                        (cursor_name.clone(), cursor_coord, stop_name.clone(), stop_coord, 0.0, false, false, vec![cursor_coord, stop_coord])
+                        // RAPTOR 内部の近接駅徒歩乗換 (footpath)。RAPTOR は直線距離近似で
+                        // 所要秒しか持たないため、ここで access/egress と同じ profile の
+                        // 街路 A* を引き、実ジオメトリ・実距離・実段差/EV を補う。
+                        // duration_s は RAPTOR の乗換所要のまま変えない (この秒数で時刻表
+                        // 接続が計算済みのため、変えると board/alight の整合が壊れる)。
+                        // 引けない/信用できない場合は 2点直線 + street_routed=false
+                        // (未検証の距離0・段差なしを「検証済み」と偽らない)。
+                        match self.transfer_street_path(cursor_coord, stop_coord, *duration_s, profile, transfer_cache) {
+                            Some(p) => {
+                                let geom = self.street.path_coords(&p);
+                                (cursor_name.clone(), cursor_coord, stop_name.clone(), stop_coord, p.distance_m, p.has_stairs, p.has_elevator, true, geom)
+                            }
+                            None => (cursor_name.clone(), cursor_coord, stop_name.clone(), stop_coord, 0.0, false, false, false, vec![cursor_coord, stop_coord]),
+                        }
                     };
                     // access 以外はジオメトリが空になりうる (footpath は上で2点直線を入れた
                     // ので空にならないが、街路経路が取れなかった端点用のフォールバック)。
                     let geometry = if geometry.len() >= 2 { geometry } else { vec![from_coord, to_coord] };
                     cursor_name = to_name.clone();
                     cursor_coord = to_coord;
-                    legs.push(Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s: *duration_s, has_stairs, has_elevator, geometry });
+                    legs.push(Leg::Walk { from_name, from_coord, to_name, to_coord, distance_m, duration_s: *duration_s, has_stairs, has_elevator, street_routed, geometry });
                 }
                 otp_raptor::JourneyLeg::Transit { route_short_name, route_long_name, route_type, agency_id, from, to, board_s, alight_s, intermediate, .. } => {
                     let from_name = self.timetable.stop_name(*from).to_string();

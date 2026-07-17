@@ -147,8 +147,15 @@ pub enum LegDto {
         distance_m: f32,
         #[serde(rename = "durationS")]
         duration_s: u32,
-        #[serde(rename = "hasStairs")]
-        has_stairs: bool,
+        /// 経路に階段が含まれるか。街路経路を引けなかった 2点直線フォールバック
+        /// (`Leg::Walk::street_routed=false`) では **未検証** なので `None` にして
+        /// キー自体を省略する (false を出すと「階段なしを検証済み」という嘘になる。
+        /// クライアントはキー欠落を「データ未反映」として扱う)。
+        #[serde(rename = "hasStairs", skip_serializing_if = "Option::is_none")]
+        has_stairs: Option<bool>,
+        /// エレベーター経由か。省略の意味は `has_stairs` と同じ。
+        #[serde(rename = "hasElevator", skip_serializing_if = "Option::is_none")]
+        has_elevator: Option<bool>,
         /// 折れ線 (始点→終点)。
         geometry: Vec<CoordDto>,
         /// 徒歩は途中駅の概念が無いが、乗車 leg と形を揃えるため空配列を出す。
@@ -196,12 +203,14 @@ impl ItineraryDto {
 impl LegDto {
     fn from_leg(leg: &Leg) -> Self {
         match leg {
-            Leg::Walk { from_name, to_name, distance_m, duration_s, has_stairs, geometry, .. } => LegDto::Walk {
+            Leg::Walk { from_name, to_name, distance_m, duration_s, has_stairs, has_elevator, street_routed, geometry, .. } => LegDto::Walk {
                 from_name: from_name.clone(),
                 to_name: to_name.clone(),
                 distance_m: *distance_m,
                 duration_s: *duration_s,
-                has_stairs: *has_stairs,
+                // 街路経路を引けた徒歩だけ段差/EV を「検証済みデータ」として出す。
+                has_stairs: street_routed.then_some(*has_stairs),
+                has_elevator: street_routed.then_some(*has_elevator),
                 geometry: geometry.iter().map(|c| (*c).into()).collect(),
                 intermediate_stops: vec![],
             },
@@ -295,6 +304,7 @@ mod tests {
                     duration_s: 90,
                     has_stairs: false,
                     has_elevator: false,
+                    street_routed: true,
                     geometry: vec![LatLng::new(35.69, 139.70), LatLng::new(35.691, 139.70)],
                 },
                 Leg::Transit {
@@ -333,6 +343,38 @@ mod tests {
         assert!(json.contains("\"name\":\"市ヶ谷\""), "中間駅名: {json}");
         assert!(json.contains("\"arrivalSecondsSinceMidnight\":29400"), "中間駅の生秒: {json}");
         assert!(json.contains("\"secondsFromBoard\":600"), "乗車からの経過秒: {json}");
+    }
+
+    #[test]
+    fn walk_leg_dto_omits_accessibility_keys_unless_street_routed() {
+        // street_routed=false (街路経路を引けなかった 2点直線フォールバック) では
+        // hasStairs/hasElevator キー自体を出さない (未検証を「階段なし」と偽らない)。
+        let make = |street_routed: bool| Itinerary {
+            legs: vec![Leg::Walk {
+                from_name: "丸ノ内線新宿".to_string(),
+                from_coord: LatLng::new(35.691, 139.699),
+                to_name: "京王線新宿".to_string(),
+                to_coord: LatLng::new(35.689, 139.699),
+                distance_m: if street_routed { 324.0 } else { 0.0 },
+                duration_s: 369,
+                has_stairs: true,
+                has_elevator: true,
+                street_routed,
+                geometry: vec![LatLng::new(35.691, 139.699), LatLng::new(35.689, 139.699)],
+            }],
+            total_duration_s: 369,
+            transfers: 0,
+            fare_yen: None,
+            depart_s: 8 * 3600,
+        };
+
+        let json = serde_json::to_string(&PlanResponseDto::from_itineraries(&[make(false)])).unwrap();
+        assert!(!json.contains("hasStairs"), "未検証の徒歩に hasStairs を出さない: {json}");
+        assert!(!json.contains("hasElevator"), "未検証の徒歩に hasElevator を出さない: {json}");
+
+        let json = serde_json::to_string(&PlanResponseDto::from_itineraries(&[make(true)])).unwrap();
+        assert!(json.contains("\"hasStairs\":true"), "検証済みの徒歩は hasStairs を出す: {json}");
+        assert!(json.contains("\"hasElevator\":true"), "検証済みの徒歩は hasElevator を出す: {json}");
     }
 
     #[test]
