@@ -36,10 +36,25 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../gtfs/tests/fixtures/mini"))
 }
 
+/// [`WALK_FIXTURE_OSM`] の A側 footway を階段 (highway=steps) に変えたもの。
+/// A駅への唯一のアクセスが階段のみ、という状況を作る (D側は階段なしのまま)。
+const WALK_FIXTURE_STAIRS_ONLY_ACCESS_OSM: &str = r#"<osm version="0.6">
+    <node id="1" lat="34.9995" lon="138.9995"/>
+    <node id="2" lat="35.00" lon="139.00"/>
+    <way id="1"><nd ref="1"/><nd ref="2"/><tag k="highway" v="steps"/></way>
+    <node id="3" lat="35.03" lon="139.03"/>
+    <node id="4" lat="35.0305" lon="139.0305"/>
+    <way id="2"><nd ref="3"/><nd ref="4"/><tag k="highway" v="footway"/></way>
+</osm>"#;
+
 fn build_engine() -> Engine {
+    build_engine_with_osm(WALK_FIXTURE_OSM)
+}
+
+fn build_engine_with_osm(osm: &str) -> Engine {
     let feed = Feed::load_from_dir(&fixture_dir()).expect("mini fixture should load");
     let timetable = Timetable::build(&[feed]).expect("timetable should build");
-    let street = StreetGraph::build_from_osm_xml_str(WALK_FIXTURE_OSM);
+    let street = StreetGraph::build_from_osm_xml_str(osm);
     // mini fixture は Feed::load_from_dir_namespaced を通さない単一フィード構成で、
     // stops.txt に zone_id も無い (運賃ゾーン無し)。運賃配線そのもの (フィード名前空間
     // 単位での FareModel 選択・ゾーン一致) の実データ検証は `tests/door_to_door.rs`
@@ -166,6 +181,32 @@ fn transit_leg_exposes_intermediate_stops_with_resolved_names() {
         })
         .expect("C駅発の Transit leg があるはず");
     assert!(second_transit.is_empty(), "C駅→D駅 直行は中間駅なし: {second_transit:?}");
+}
+
+/// アクセスが階段のみの駅しか無い場合、ベビーカー/車いすでは「階段ありの経路を
+/// でっち上げる」のではなく空の結果 (経路なし) を返す。Solo は従来通り階段経由で
+/// 経路が出る (access 徒歩 leg に has_stairs=true が立つ)。
+///
+/// これは WalkProfile::forbid_stairs (階段ハード除外) の engine 統合の回帰テスト:
+/// access 候補が全滅 → `access_links` が空 → `plan` は Ok(空 Vec)。
+#[test]
+fn stroller_and_wheelchair_get_no_itinerary_when_only_access_is_stairs() {
+    let engine = build_engine_with_osm(WALK_FIXTURE_STAIRS_ONLY_ACCESS_OSM);
+
+    let solo = engine.plan(&base_request(Mobility::Solo)).expect("solo plan should not error");
+    assert!(!solo.is_empty(), "solo は階段経由で経路が出るはず");
+    match &solo[0].legs[0] {
+        Leg::Walk { has_stairs, .. } => assert!(has_stairs, "solo の access 徒歩は階段を含むはず"),
+        other => panic!("先頭は access の Walk leg のはず: {other:?}"),
+    }
+
+    for mobility in [Mobility::Stroller, Mobility::Wheelchair] {
+        let its = engine.plan(&base_request(mobility)).expect("plan should not error");
+        assert!(
+            its.is_empty(),
+            "{mobility:?}: 階段しかないアクセスでは経路をでっち上げず空を返すはず: {its:?}"
+        );
+    }
 }
 
 #[test]
